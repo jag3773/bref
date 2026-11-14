@@ -104,13 +104,13 @@ impl Editor {
     // ponytail: the counter's room is estimated (7.4 px per character at 12 px, spaces and middle dots count more than letters) rather than measured.
     pub(super) fn bar_place(&mut self) -> Option<Bar> {
         let width = f32::from(self.viewport.size.width);
-        if !self.theme.bar || !self.bar_here || width == 0. {
+        if !self.theme.bar || !self.chrome.bar_here || width == 0. {
             return None;
         }
         // At the interface's scale, like the counter and the buttons around.
         let (u, bar) = (self.theme.ui, BAR_WIDTH * self.theme.ui);
         let counts = (self.counts().chars().count() as f32 * 7.4 + 16.) * u;
-        let x = (width / 2. - bar / 2.).min(width - (12. + 34. * self.corner as f32) * u - counts - 8. * u - bar);
+        let x = (width / 2. - bar / 2.).min(width - (12. + 34. * self.chrome.corner as f32) * u - counts - 8. * u - bar);
         Some(if x >= 8. * u { Bar::Inline(x) } else { Bar::Compact })
     }
 
@@ -241,7 +241,7 @@ impl Editor {
                 .justify_center()
                 .rounded(t.small())
                 .cursor_pointer()
-                .text_size(t.px(13.))
+                .text_size(t.font_body())
                 .text_color(if lit { t.accent } else { t.soft })
                 .when(lit, |d| d.bg(t.selection))
                 .hover(|s| s.bg(t.hover).text_color(t.text))
@@ -361,7 +361,7 @@ impl Editor {
         let t = self.theme;
         let open = self.bar.open;
         let left = f32::from(self.viewport.size.width) / 2. - 15. * t.ui;
-        div()
+        crate::ui::widgets::popover(t)
             .id("format-toggle")
             .debug_selector(|| "format-toggle".into())
             .absolute()
@@ -371,11 +371,7 @@ impl Editor {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(t.large())
-            .border_1()
-            .border_color(t.border)
             .bg(bar_fill(&t, open))
-            .shadow(t.floating())
             .cursor_pointer()
             .hover(|s| s.bg(t.hover))
             .occlude()

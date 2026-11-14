@@ -70,14 +70,14 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
     assert!(shell.read_with(cx, |s, _| s.images.contains(&file)));
     cx.simulate_keystrokes("escape escape");
     cx.run_until_parked();
-    assert!(shell.read_with(cx, |s, _| s.pane().file.is_none() && s.pane().drawing().is_none()));
+    assert!(shell.read_with(cx, |s, _| s.pane().file().is_none() && s.pane().drawing().is_none()));
 
     // `![[` offers the vault's images and diagrams; Enter completes the name.
     cx.simulate_keystrokes("secondary-end enter");
     cx.simulate_input("![[sch");
     cx.simulate_keystrokes("enter");
     assert!(text(cx).ends_with("![[Schéma.svg]]"));
-    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.executor().advance_clock(SAVED);
     cx.run_until_parked();
 
     // `/` commands: the list filters by name or label; Enter inserts the
@@ -183,7 +183,7 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
     assert!(written.lines().any(|l| l == unknown) && edited.shapes.len() == 2 && edited.shapes[1].id == 10);
     cx.simulate_keystrokes("escape escape");
     cx.run_until_parked();
-    assert!(shell.read_with(cx, |s, _| s.pane().file.is_none()));
+    assert!(shell.read_with(cx, |s, _| s.pane().file().is_none()));
     fs::remove_file(&newer).unwrap();
     fs::remove_file(&mixed).unwrap();
 
@@ -592,8 +592,17 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
         // The extension points are under the name, behind a separator that stays inside the ellipse.
         let pay = &d.shapes[1];
         assert_eq!(pay.text, "Pay\n---\nextension points\nby card");
-        let rule = svg.lines().find(|l| l.starts_with("<path d=\"M") && l.contains('H') && !l.contains('L') && !l.contains('C')).unwrap();
-        let (x0, x1) = rule.trim_start_matches("<path d=\"M").split_once("\"").unwrap().0.split_once(' ').map(|(x, rest)| (x.parse::<f32>().unwrap(), rest.split_once('H').unwrap().1.parse::<f32>().unwrap())).unwrap();
+        // A rule is a horizontal segment, `M x0 yLx1 y`, with its ends in the ellipse's box.
+        let segment = |l: &str| -> Option<(f32, f32, f32)> {
+            let d = l.strip_prefix("<path d=\"M")?.split_once('"')?.0;
+            let (from, to) = d.split_once('L')?;
+            let (x0, y0) = from.split_once(' ')?;
+            let (x1, y1) = to.split_once(' ')?;
+            let (x0, y0, x1, y1) = (x0.parse::<f32>().ok()?, y0.parse::<f32>().ok()?, x1.parse::<f32>().ok()?, y1.parse::<f32>().ok()?);
+            (y0 == y1 && y0 > pay.y && y0 < pay.y + pay.h && x0 > pay.x && x1 < pay.x + pay.w && x0 < x1).then_some((x0, x1, y0))
+        };
+        let rule = svg.lines().find(|l| segment(l).is_some()).unwrap();
+        let (x0, x1, _) = segment(rule).unwrap();
         assert!(x0 > pay.x && x1 < pay.x + pay.w, "{rule}");
         assert!(svg.contains(">«include»</text>") && svg.contains(">«extend»</text>") && svg.contains(">Customer</text>") && svg.contains(">Shop</text>"), "{svg}");
         cx.simulate_keystrokes("escape escape");
@@ -1036,7 +1045,7 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
             cx.run_until_parked();
         };
         let ask = |cx: &mut gpui::VisualTestContext| {
-            let figure = shell.read_with(cx, |s, _| s.pane().figure.clone()).unwrap();
+            let figure = shell.read_with(cx, |s, _| s.pane().figure().cloned()).unwrap();
             figure.update(cx, |f, cx| f.edit_on_canvas(cx));
             cx.run_until_parked();
         };
@@ -1046,12 +1055,12 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
         let count = files(&root);
         show(cx, "flowchart LR\nA --> B");
         ask(cx);
-        assert!(shell.read_with(cx, |s, _| s.pane().figure.is_some() && s.pane().drawing().is_none()));
+        assert!(shell.read_with(cx, |s, _| s.pane().figure().is_some() && s.pane().drawing().is_none()));
         assert_eq!(files(&root), count);
         // A sequence diagram, one line of which is not understood.
         show(cx, "sequenceDiagram\nA->>B: hi\nB-->>A: ho\nNote over A,B: x");
         ask(cx);
-        let (path, canvas, figure) = shell.read_with(cx, |s, _| (s.pane().file_path().cloned(), s.pane().drawing().cloned(), s.pane().figure.is_some()));
+        let (path, canvas, figure) = shell.read_with(cx, |s, _| (s.pane().file_path().cloned(), s.pane().drawing().cloned(), s.pane().figure().is_some()));
         let (path, canvas) = (path.unwrap(), canvas.unwrap());
         assert!(!figure, "the diagram takes the figure's place");
         let d = canvas.read_with(cx, |c, _| c.diagram().clone());
@@ -1083,9 +1092,8 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
         fs::write(&drawing, Diagram::blank().to_svg(diagram::COLORS[0])).unwrap();
         let before: std::collections::HashSet<_> = fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).collect();
         shell.update_in(cx, |s, window, cx| {
-            s.nav.sel = Some(drawing.clone());
-            s.nav.show_alone(crate::views::nav::Mode::Tree);
-            s.nav.panel = crate::views::nav::Panel::Split;
+            s.nav.set_sel(Some(drawing.clone()));
+            s.show_panel(crate::views::nav::Mode::Tree, crate::views::nav::Panel::Split, cx);
             s.new_diagram(window, cx);
         });
         cx.run_until_parked();
@@ -1093,7 +1101,7 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
         assert!(made.len() == 1 && made[0].extension().is_some_and(|e| e == "svg") && made[0].is_file(), "{made:?}");
         // The same for a new note.
         shell.update_in(cx, |s, window, cx| {
-            s.nav.sel = Some(drawing.clone());
+            s.nav.set_sel(Some(drawing.clone()));
             s.new_note_in(s.nav.target_dir(), window, cx);
         });
         cx.run_until_parked();
@@ -1101,7 +1109,7 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
         cx.run_until_parked();
         fs::remove_file(&drawing).unwrap();
         fs::remove_file(&made[0]).unwrap();
-        shell.update(cx, |s, _| s.nav.sel = None);
+        shell.update(cx, |s, _| s.nav.set_sel(None));
     }
     // Dragged from the bar or from the library, a shape lands centred on the pointer, and what is drawn under the pointer
     // while it is dragged is centred on it too.
@@ -1472,6 +1480,6 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
     }
     fs::remove_file(&styled).unwrap();
     j.settle(cx);
-    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.executor().advance_clock(SAVED);
     cx.run_until_parked();
 }

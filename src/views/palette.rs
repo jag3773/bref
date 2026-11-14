@@ -1,13 +1,13 @@
 //! Palette (Ctrl+P): note search, `#tag` filter, creation, vault.
 //! Also serves as a plain input field (folder name, new name).
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, ElementInputHandler, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, UTF16Selection, Window,
+    Animation, AnimationExt, App, Context, ElementInputHandler,
+    EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Window,
     actions, canvas, div, ease_out_quint, prelude::*, px, svg,
 };
 
@@ -15,31 +15,13 @@ use crate::{
     ui::theme::Theme,
     ui::line::{self, Line},
     ui::widgets::keycaps,
-    views::editor::TableOp,
     logic::markdown::ListStyle,
-    logic::rank::{self, contains_all, fuzzy, snippet},
-    views::sheet::Pick,
-    lang::tr,
+    logic::rank::{Words, fuzzy},
+    lang::{fold, tr},
 };
 
 /// Height of a row of the list.
 const ROW: f32 = 38.;
-
-fn vault_label() -> &'static str {
-    tr("Change vault…", "Changer de coffre…")
-}
-
-fn diagram_label() -> &'static str {
-    tr("New diagram", "Nouveau schéma")
-}
-
-fn folder_label() -> &'static str {
-    tr("New folder", "Nouveau dossier")
-}
-
-fn import_label() -> &'static str {
-    tr("Import a diagram (Excalidraw, draw.io)…", "Importer un schéma (Excalidraw, draw.io)…")
-}
 
 fn updates_label(on: bool) -> &'static str {
     if on {
@@ -57,46 +39,6 @@ fn install_label(version: &str) -> String {
     format!("{} {version}", tr("Update Bref to", "Mettre à jour Bref vers"))
 }
 
-pub fn sync_label() -> &'static str {
-    tr("Sync the vault (git)", "Synchroniser le coffre (git)")
-}
-
-pub fn clone_label() -> &'static str {
-    tr("Clone a vault from a git address…", "Cloner un coffre depuis une adresse git…")
-}
-
-fn backup_label() -> &'static str {
-    tr("Back up the vault…", "Sauvegarder le coffre…")
-}
-
-fn capture_label() -> &'static str {
-    tr("Set up the quick capture shortcut", "Créer le raccourci de capture rapide")
-}
-
-fn terminal_label() -> &'static str {
-    tr("Open a terminal in the vault", "Ouvrir un terminal dans le coffre")
-}
-
-fn trash_label() -> &'static str {
-    tr("Restore from the trash…", "Restaurer depuis la corbeille…")
-}
-
-pub fn back_label() -> &'static str {
-    tr("Back: what was shown before", "Précédent : ce qui était affiché avant")
-}
-
-pub fn forward_label() -> &'static str {
-    tr("Forward: what was shown after", "Suivant : ce qui était affiché après")
-}
-
-fn today_label() -> &'static str {
-    tr("Today's note", "Note du jour")
-}
-
-fn board_label() -> &'static str {
-    tr("New kanban board", "Nouveau tableau kanban")
-}
-
 fn undo_swap_label() -> &'static str {
     tr("Undo the replacement in the vault", "Annuler le remplacement dans le coffre")
 }
@@ -108,18 +50,6 @@ fn list_label(style: ListStyle) -> &'static str {
         ListStyle::Task => tr("Turn into a task list", "Transformer en liste de tâches"),
         ListStyle::Text => tr("Turn into plain text", "Transformer en texte simple"),
     }
-}
-
-fn comments_label() -> &'static str {
-    tr("Comments of the note", "Commentaires de la note")
-}
-
-fn outline_label() -> &'static str {
-    tr("Outline of the note", "Plan de la note")
-}
-
-fn help_label() -> &'static str {
-    tr("Keyboard shortcuts, about", "Raccourcis clavier, à propos")
 }
 
 /// Appearance setting offered by the palette.
@@ -179,9 +109,8 @@ pub struct Entry {
     pub tags: Arc<[String]>,
     /// Whole days since the file was written; `None` when unknown.
     pub days: Option<u64>,
-    /// Text of the note, and the same in lowercase, for full-text search.
+    /// Text of the note, for full-text search.
     pub body: Arc<str>,
-    pub lower: Arc<str>,
 }
 
 pub enum PaletteEvent {
@@ -189,46 +118,17 @@ pub enum PaletteEvent {
     /// An app command: the name of its action.
     Run(&'static str),
     Create(String),
-    ChangeVault,
-    Help,
-    NewDiagram,
-    NewFolder,
-    ImportDiagram,
     Setting(Setting),
-    /// Setting or gesture of the shown table.
-    Table(Pick),
     /// The chosen lines of the note, as a list or as text.
     Restyle(ListStyle),
-    /// A gesture on the table under the cursor.
-    Grid(TableOp),
     /// A note born from a template, a template inserted, or the note saved as a template.
     Template(TemplateAct),
     /// Turns the new-version check on or off.
     ToggleUpdates,
     /// Checks for a new version right now.
     CheckUpdate,
-    /// List of the note's headings.
-    Outline,
-    /// List of the note's comments.
-    Comments,
     /// Undoes the last vault-wide replacement.
     UndoSwap,
-    /// Creates a note that opens as a kanban board.
-    NewBoard,
-    /// Opens or creates the daily note.
-    Today,
-    /// Back (`false`) or forward (`true`) in what has been shown.
-    Travel(bool),
-    /// Lists the vault's trash, to restore an item from it.
-    Trash,
-    /// Archives the vault into a folder to choose.
-    Backup,
-    Sync,
-    CloneVault,
-    /// Opens the system terminal in the vault folder.
-    Terminal,
-    /// Binds capture (`bref --capture`) to a desktop shortcut.
-    CaptureKey,
     /// Installs the new version.
     InstallUpdate,
     /// Text submitted in an input field, or choice submitted in a list.
@@ -244,31 +144,12 @@ enum Item {
     /// Note whose text, not name, matches the search.
     Text(usize),
     Create,
-    Vault,
-    Help,
-    Diagram,
-    Folder,
-    Import,
     Updates,
     Check,
     Install,
-    Outline,
-    Comments,
     UndoSwap,
-    Board,
-    Today,
-    Back,
-    Forward,
-    Trash,
-    Backup,
-    Sync,
-    CloneVault,
-    Terminal,
-    CaptureKey,
     Setting(Setting),
-    Table(Pick),
     Restyle(ListStyle),
-    Grid(TableOp),
     Template(TemplateAct),
     /// An app command (`commands`), by its index.
     Command(usize),
@@ -284,6 +165,8 @@ pub struct Palette {
     entries: Vec<Entry>,
     /// The name of each entry in lowercase, done once: the list is rebuilt on every keystroke.
     names: Vec<String>,
+    /// The words typed, as the notes' text is searched for them: kept for the excerpt of each row found.
+    words: Words,
     items: Vec<Item>,
     selected: usize,
     /// Input field: its label. No note is offered then.
@@ -295,14 +178,12 @@ pub struct Palette {
     updates: Option<bool>,
     /// Number of the new version the app can install by itself.
     installable: Option<String>,
-    /// A table is shown: its settings are searched here.
-    table: bool,
     /// A note is shown: its lines can become a list.
     lists: bool,
-    /// The cursor is in a Markdown table: its rows and columns are managed from here.
-    cells: bool,
     /// A vault replacement can be undone.
     undo_swap: bool,
+    /// The command that wears a dot: something new to look at there (the health page's broken links).
+    dot: Option<&'static str>,
     /// The commands the view can do, the view's own first (the first `here`): the
     /// palette finds them by what they do, and offers the `here` ones without typing anything.
     commands: Vec<crate::logic::commands::Command>,
@@ -331,7 +212,7 @@ impl Focusable for Palette {
 /// starts one of its words (`new fol`: "New folder"). No subsequence, unlike
 /// notes: `plan` would bring up « Annuler le remplacement ».
 pub fn command(query: &str, label: &str) -> bool {
-    let (query, label) = (rank::fold(query), rank::fold(label));
+    let (query, label) = (fold(query), fold(label));
     if label.contains(query.trim()) {
         return true;
     }
@@ -357,6 +238,7 @@ impl Palette {
             focus: cx.focus_handle(),
             query: Line::new(query),
             names: entries.iter().map(|e| e.name.to_lowercase()).collect(),
+            words: Words::default(),
             entries,
             items: Vec::new(),
             selected: 0,
@@ -366,10 +248,9 @@ impl Palette {
             choices: false,
             updates: None,
             installable: None,
-            table: false,
             lists: false,
-            cells: false,
             undo_swap: false,
+            dot: None,
             commands: Vec::new(),
             here: 0,
             commands_only: false,
@@ -398,26 +279,20 @@ impl Palette {
         self
     }
 
+    /// The command `action` wears a dot: it has something new to show.
+    pub fn with_dot(mut self, action: Option<&'static str>) -> Self {
+        self.dot = action;
+        self
+    }
+
     pub fn with_undo_swap(mut self, possible: bool) -> Self {
         self.undo_swap = possible;
         self.refresh();
         self
     }
 
-    pub fn with_cells(mut self, here: bool) -> Self {
-        self.cells = here;
-        self.refresh();
-        self
-    }
-
     pub fn with_lists(mut self, shown: bool) -> Self {
         self.lists = shown;
-        self.refresh();
-        self
-    }
-
-    pub fn with_table(mut self, shown: bool) -> Self {
-        self.table = shown;
         self.refresh();
         self
     }
@@ -481,6 +356,12 @@ impl Palette {
     #[cfg(test)]
     pub fn runs(&self) -> Vec<&'static str> {
         self.items.iter().filter_map(|item| if let &Item::Command(n) = item { Some(self.commands[n].action) } else { None }).collect()
+    }
+
+    /// What is typed.
+    #[cfg(test)]
+    pub fn typed_text(&self) -> &str {
+        &self.query.text
     }
 
     #[cfg(test)]
@@ -569,10 +450,10 @@ impl Palette {
             // After the names: the notes whose text contains all the words, most recent first.
             // A single letter would bring up nearly all of them.
             if !self.choices && q.chars().count() >= 2 {
-                let words: Vec<&str> = q.split_whitespace().collect();
+                self.words = Words::of(&q);
                 items.extend(
                     (0..self.entries.len())
-                        .filter(|&i| !named[i] && contains_all(&self.entries[i].lower, &words))
+                        .filter(|&i| !named[i] && self.words.all_in(&self.entries[i].body))
                         .take(8)
                         .map(Item::Text),
                 );
@@ -589,26 +470,17 @@ impl Palette {
         if q.is_empty() && self.context != "Note" {
             items.extend((0..self.here.min(self.commands.len()).min(6)).map(Item::Command));
         }
+        // A command whose name is what was typed (« santé ») comes before « Create »: Enter runs it,
+        // rather than making a note of its name.
+        let named: Vec<usize> = (0..self.commands.len()).filter(|&i| !self.commands[i].pinned && self.commands[i].named(&q)).take(3).collect();
+        items.extend(named.iter().map(|&i| Item::Command(i)));
         let exact = self.names.contains(&q);
         if !q.is_empty() && !q.starts_with('#') && !exact {
             items.push(Item::Create);
         }
-        for (label, item) in [(vault_label(), Item::Vault), (help_label(), Item::Help)] {
-            if command(&q, label) {
-                items.push(item);
-            }
-        }
-        // Like the settings: offered only when searched for.
-        for (label, item) in [(diagram_label(), Item::Diagram), (folder_label(), Item::Folder), (import_label(), Item::Import)] {
-            if !q.is_empty() && command(&q, label) {
-                items.push(item);
-            }
-        }
-        for (label, item) in [(outline_label(), Item::Outline), (comments_label(), Item::Comments), (board_label(), Item::Board), (today_label(), Item::Today), (back_label(), Item::Back), (forward_label(), Item::Forward), (trash_label(), Item::Trash), (backup_label(), Item::Backup), (sync_label(), Item::Sync), (clone_label(), Item::CloneVault), (terminal_label(), Item::Terminal), (capture_label(), Item::CaptureKey)] {
-            if !q.is_empty() && command(&q, label) {
-                items.push(item);
-            }
-        }
+        // Offered even when nothing is typed: the vault and the help.
+        let pinned = |c: &crate::logic::commands::Command| c.pinned && command(&q, c.label);
+        items.extend((0..self.commands.len()).filter(|&i| pinned(&self.commands[i])).map(Item::Command));
         if self.undo_swap && !q.is_empty() && command(&q, undo_swap_label()) {
             items.push(Item::UndoSwap);
         }
@@ -627,18 +499,8 @@ impl Palette {
         if self.updates.is_some() && !q.is_empty() && command(&q, check_label()) {
             items.push(Item::Check);
         }
-        if self.table && !q.is_empty() {
-            items.extend(
-                Pick::ALL.into_iter().filter(|p| command(&q, p.label())).map(Item::Table),
-            );
-        }
-        if (self.cells || self.table) && !q.is_empty() {
-            let shown = |op: &TableOp| (self.cells || op.in_sheet()) && command(&q, op.label());
-            items.extend(TableOp::ALL.into_iter().filter(shown).map(Item::Grid));
-        }
-        if !q.is_empty() {
-            let acts = [TemplateAct::New, TemplateAct::Insert, TemplateAct::Save];
-            items.extend(acts.into_iter().filter(|a| (*a == TemplateAct::New || self.lists) && command(&q, a.label())).map(Item::Template));
+        if !q.is_empty() && self.lists {
+            items.extend([TemplateAct::Insert, TemplateAct::Save].into_iter().filter(|a| command(&q, a.label())).map(Item::Template));
         }
         if self.lists && !q.is_empty() {
             items.extend(
@@ -648,24 +510,13 @@ impl Palette {
                     .map(Item::Restyle),
             );
         }
-        // The app's commands, by what they do; those the palette already offers under another
-        // name (table gestures, outline, daily note…) are not there twice.
+        // The app's commands, by what they do (the pinned ones are above already).
         if !q.is_empty() {
-            let doubled = |name: &str| {
-                name.starts_with("editor::Table")
-                    || name.starts_with("sheet::Pick")
-                    || matches!(
-                        name,
-                        "app::Outline" | "app::Today" | "app::OpenVault" | "app::GoBack" | "app::GoForward" | "app::SyncVault" | "app::ToggleHelp"
-                            | "app::NewDiagram" | "nav::NewFolder" | "app::NewFromTemplate" | "app::ChooseTheme" | "editor::ListBullet"
-                            | "editor::ListOrdered" | "editor::ListTask"
-                    )
-            };
-            let found = (0..self.commands.len()).filter(|&i| !doubled(self.commands[i].action) && command(&q, self.commands[i].label));
+            let found = (0..self.commands.len()).filter(|&i| !self.commands[i].pinned && !named.contains(&i) && (command(&q, self.commands[i].label) || command(&q, self.commands[i].also)));
             items.extend(found.take(8).map(Item::Command));
         }
         // The settings do not clutter the list until searched for.
-        for setting in [Setting::Theme, Setting::Font, Setting::Mono, Setting::Page, Setting::Wide, Setting::Bar, Setting::Motion] {
+        for setting in [Setting::Font, Setting::Mono, Setting::Page, Setting::Wide, Setting::Bar, Setting::Motion] {
             if !q.is_empty() && command(&q, setting.label()) {
                 items.push(Item::Setting(setting));
             }
@@ -695,113 +546,36 @@ impl Palette {
         cx.emit(match self.items.get(index) {
             Some(Item::Note(i) | Item::Text(i)) => PaletteEvent::Open(self.entries[*i].path.clone()),
             Some(Item::Create) => PaletteEvent::Create(self.query.text.trim().to_string()),
-            Some(Item::Vault) => PaletteEvent::ChangeVault,
-            Some(Item::Help) => PaletteEvent::Help,
-            Some(Item::Diagram) => PaletteEvent::NewDiagram,
-            Some(Item::Folder) => PaletteEvent::NewFolder,
-            Some(&Item::Table(pick)) => PaletteEvent::Table(pick),
             Some(&Item::Restyle(style)) => PaletteEvent::Restyle(style),
-            Some(&Item::Grid(op)) => PaletteEvent::Grid(op),
             Some(&Item::Command(n)) => PaletteEvent::Run(self.commands[n].action),
             Some(&Item::Template(act)) => PaletteEvent::Template(act),
-            Some(Item::Import) => PaletteEvent::ImportDiagram,
             Some(Item::Updates) => PaletteEvent::ToggleUpdates,
             Some(Item::Check) => PaletteEvent::CheckUpdate,
-            Some(Item::Outline) => PaletteEvent::Outline,
-            Some(Item::Comments) => PaletteEvent::Comments,
             Some(Item::UndoSwap) => PaletteEvent::UndoSwap,
-            Some(Item::Board) => PaletteEvent::NewBoard,
-            Some(Item::Today) => PaletteEvent::Today,
-            Some(Item::Back) => PaletteEvent::Travel(false),
-            Some(Item::Forward) => PaletteEvent::Travel(true),
-            Some(Item::Trash) => PaletteEvent::Trash,
-            Some(Item::Backup) => PaletteEvent::Backup,
-            Some(Item::Sync) => PaletteEvent::Sync,
-            Some(Item::CloneVault) => PaletteEvent::CloneVault,
-            Some(Item::Terminal) => PaletteEvent::Terminal,
-            Some(Item::CaptureKey) => PaletteEvent::CaptureKey,
             Some(Item::Install) => PaletteEvent::InstallUpdate,
             Some(Item::Setting(setting)) => PaletteEvent::Setting(*setting),
             None => PaletteEvent::Dismiss,
         });
     }
+}
 
-    fn typed(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.query.insert(text);
+impl crate::ui::line::LineInput for Palette {
+    fn line(&self) -> Option<&Line> {
+        Some(&self.query)
+    }
+
+    fn line_mut(&mut self) -> Option<&mut Line> {
+        Some(&mut self.query)
+    }
+
+    fn edited(&mut self, cx: &mut Context<Self>) {
         self.refresh();
         self.preview(cx);
         cx.notify();
     }
 }
 
-// ponytail: input reduced to "append at the end" (no movable cursor nor
-// IME composition in the palette); enough for a search query.
-impl EntityInputHandler for Palette {
-    fn text_for_range(
-        &mut self,
-        _: Range<usize>,
-        _: &mut Option<Range<usize>>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<String> {
-        None
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _: bool,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        Some(self.query.utf16())
-    }
-
-    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        None
-    }
-
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
-
-    fn replace_text_in_range(
-        &mut self,
-        _: Option<Range<usize>>,
-        text: &str,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.typed(text, cx);
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        _: Option<Range<usize>>,
-        text: &str,
-        _: Option<Range<usize>>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.typed(text, cx);
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _: Range<usize>,
-        _: Bounds<Pixels>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        None
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        _: Point<Pixels>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<usize> {
-        None
-    }
-}
+crate::ui::line::line_input!(Palette);
 
 impl Palette {
     /// A command: its icon, its label, its keys one by one; above, the title of its group
@@ -831,7 +605,14 @@ impl Palette {
             .when(!on, |d| d.hover(|s| s.bg(t.hover)))
             .child(svg().path(c.icon).size(t.px(16.)).flex_none().text_color(if on { t.accent } else { t.soft }))
             .child(div().flex_1().min_w_0().truncate().child(c.label))
-            .child(keycaps(&c.keys, t, on).flex_none())
+            .when(self.dot == Some(c.action), |d| {
+                let action = c.action;
+                d.child(div().debug_selector(move || format!("command-dot-{action}")).flex_none().text_color(t.accent).child("●"))
+            })
+            .child(keycaps(&c.keys, t, on).debug_selector({
+                let action = c.action;
+                move || format!("command-keys-{action}")
+            }).flex_none())
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.confirm(i, cx)));
         div().flex().flex_col().children(title).child(row)
     }
@@ -886,7 +667,7 @@ impl Render for Palette {
         let rows = self.items.iter().enumerate().skip(first).take(14).map(|(i, item)| {
             if let &Item::Command(n) = item {
                 // Without typing anything, commands go by group, each under its title.
-                let grouped = self.query.text.trim().is_empty();
+                let grouped = self.query.text.trim().is_empty() && (self.commands_only || n < self.here);
                 let group = self.commands[n].group;
                 let same = |prev: Option<&Item>| matches!(prev, Some(&Item::Command(m)) if self.commands[m].group == group);
                 let header = grouped && (i == first || !same(i.checked_sub(1).and_then(|p| self.items.get(p))));
@@ -905,53 +686,28 @@ impl Render for Palette {
                 }
                 Item::Text(n) => {
                     let e = &self.entries[*n];
-                    let word = self.query.text.trim().to_lowercase();
-                    let word = word.split_whitespace().next().unwrap_or_default().to_string();
-                    (e.name.clone(), snippet(&e.body, &e.lower, &word))
+                    (e.name.clone(), self.words.snippet(&e.body))
                 }
                 Item::Create => (
                     format!("{} « {} »", tr("Create", "Créer"), self.query.text.trim()),
                     tr("new note", "nouvelle note").into(),
                 ),
-                Item::Vault => (vault_label().to_string(), crate::ui::keys::of(cx, &crate::actions::OpenVault)),
-                Item::Help => (help_label().to_string(), crate::ui::keys::of(cx, &crate::actions::ToggleHelp)),
-                Item::Diagram => (diagram_label().to_string(), crate::ui::keys::of(cx, &crate::actions::NewDiagram)),
-                Item::Folder => (folder_label().to_string(), crate::ui::keys::of(cx, &crate::views::nav::NewFolder)),
-                Item::Import => (import_label().to_string(), String::new()),
                 Item::Updates => (updates_label(self.updates.unwrap_or(true)).to_string(), String::new()),
                 Item::Check => (check_label().to_string(), String::new()),
-                Item::Outline => (outline_label().to_string(), crate::ui::keys::of(cx, &crate::actions::Outline)),
-                Item::Comments => (comments_label().to_string(), String::new()),
                 &Item::Restyle(style) => (list_label(style).to_string(), String::new()),
-                &Item::Grid(op) => (op.label().to_string(), crate::ui::keys::of(cx, op.action().as_ref())),
+                &Item::Command(n) if self.dot == Some(self.commands[n].action) => (self.commands[n].label.to_string(), "●".to_string()),
                 &Item::Command(n) => (self.commands[n].label.to_string(), self.commands[n].keys.clone()),
-                &Item::Template(act) => (act.label().to_string(), if act == TemplateAct::New { crate::ui::keys::of(cx, &crate::actions::NewFromTemplate) } else { String::new() }),
+                &Item::Template(act) => (act.label().to_string(), String::new()),
                 Item::UndoSwap => (undo_swap_label().to_string(), String::new()),
-                Item::Board => (board_label().to_string(), String::new()),
-                Item::Today => (today_label().to_string(), crate::ui::keys::of(cx, &crate::actions::Today)),
-                Item::Back => (back_label().to_string(), crate::ui::keys::of(cx, &crate::actions::GoBack)),
-                Item::Forward => (forward_label().to_string(), crate::ui::keys::of(cx, &crate::actions::GoForward)),
-                Item::Trash => (trash_label().to_string(), String::new()),
-                Item::Backup => (backup_label().to_string(), String::new()),
-                Item::Sync => (sync_label().to_string(), crate::ui::keys::of(cx, &crate::actions::SyncVault)),
-                Item::CloneVault => (clone_label().to_string(), String::new()),
-                Item::Terminal => (terminal_label().to_string(), String::new()),
-                Item::CaptureKey => (capture_label().to_string(), String::new()),
                 Item::Install => (install_label(self.installable.as_deref().unwrap_or_default()), String::new()),
                 Item::Setting(setting) => (setting.label().to_string(), String::new()),
-                Item::Table(pick) => (pick.label().to_string(), String::new()),
             };
-            // Where the detail is a shortcut, not a description.
-            let shortcut = matches!(
-                item,
-                Item::Vault | Item::Help | Item::Diagram | Item::Folder | Item::Outline | Item::Grid(_) | Item::Template(_) | Item::Today | Item::Back | Item::Forward | Item::Sync
-            );
             let note = matches!(item, Item::Note(_));
             let age = match item {
                 Item::Note(n) => self.entries[*n].days.map(crate::lang::age),
                 _ => None,
             };
-            let soft = |d: gpui::Div| d.text_size(t.px(12.)).text_color(t.soft);
+            let soft = |d: gpui::Div| d.text_size(t.font_small()).text_color(t.soft);
             div()
                 .debug_selector(move || format!("palette-item-{i}"))
                 .mx(t.px(6.))
@@ -986,16 +742,18 @@ impl Render for Palette {
                             .when(matches!(item, Item::Text(_)), |d| d.flex_none().max_w(t.px(220.)))
                             .child(label),
                     )
-                    .child(if shortcut {
-                        keycaps(&detail, t, i == self.selected).debug_selector(move || format!("palette-detail-{i}")).flex_none()
-                    } else {
+                    .child(
                         div()
                             .truncate()
                             .when(!matches!(item, Item::Text(_)), |d| d.flex_none())
-                            .text_color(if i == self.selected { t.text } else { t.soft })
-                            .text_size(t.px(12.))
-                            .child(detail)
-                    })
+                            .text_color(match item {
+                                &Item::Command(n) if self.dot == Some(self.commands[n].action) => t.accent,
+                                _ if i == self.selected => t.text,
+                                _ => t.soft,
+                            })
+                            .text_size(t.font_small())
+                            .child(detail),
+                    )
                 })
                 .children(age.map(|age| soft(div()).debug_selector(move || format!("palette-age-{i}")).flex_none().w(t.px(56.)).text_right().child(age)))
                 .on_mouse_down(
@@ -1027,7 +785,7 @@ impl Render for Palette {
                 .flex_wrap()
                 .gap_x(t.px(16.))
                 .gap_y(t.px(4.))
-                .text_size(t.px(12.))
+                .text_size(t.font_small())
                 .text_color(t.soft)
                 .children(hints)
         });
@@ -1037,7 +795,7 @@ impl Render for Palette {
             .inset_0()
             .occlude()
             // The keys of an input line serve the question being typed.
-            .key_context("Palette Line")
+            .key_context(crate::ui::keys::context::PALETTE_LINE)
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &Next, _, cx| this.step(1, cx)))
             .on_action(cx.listener(|this, _: &Prev, _, cx| this.step(this.items.len().max(1) - 1, cx)))
@@ -1088,7 +846,7 @@ impl Render for Palette {
                             })
                             .when(!self.query.text.is_empty(), |d| {
                                 d.children(self.prompt.clone().map(|label| {
-                                    div().ml_auto().pl_3().flex_none().max_w(gpui::relative(0.45)).truncate().text_size(t.px(12.)).text_color(t.soft).child(label)
+                                    div().ml_auto().pl_3().flex_none().max_w(gpui::relative(0.45)).truncate().text_size(t.font_small()).text_color(t.soft).child(label)
                                 }))
                             })
                             // What the commands target first: the note, a table, a diagram.
@@ -1110,7 +868,7 @@ impl Render for Palette {
                     .children(rows)
                     .children(footer)
                     .children(self.nothing_to_show().map(|said| {
-                        div().debug_selector(|| "palette-empty".into()).px_4().py_3().text_center().text_size(t.px(13.)).text_color(t.soft).child(said)
+                        div().debug_selector(|| "palette-empty".into()).px_4().py_3().text_center().text_size(t.font_body()).text_color(t.soft).child(said)
                     }))
                     // The panel slides into place when opening.
                     .with_animation(
@@ -1131,6 +889,10 @@ mod tests {
         assert!(command("folder", "New folder"));
         assert!(command("new fol", "New folder"));
         assert!(command("theme", "Thème…"));
+        // Folded like the rest of the app: œ is oe, a typographic apostrophe a straight one.
+        assert!(command("coeur", "Cœur"));
+        assert!(command("l'aide", "Ouvrir l’aide"));
+        assert!(command("l’aide", "Ouvrir l'aide"));
         assert!(command("", "Change vault…"));
         // No more subsequence: scattered letters do not bring up an unrelated command.
         assert!(!command("plan", "Annuler le remplacement dans le coffre"));

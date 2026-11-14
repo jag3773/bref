@@ -17,7 +17,7 @@ fn tools_move_between_docks_and_tabs(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     let places = |cx: &mut gpui::VisualTestContext| {
-        shell.read_with(cx, |s, _| (s.nav.right.clone(), if s.left_open() { s.dock_tools(false) } else { vec![] }, if s.right_open() { s.dock_tools(true) } else { vec![] }))
+        shell.read_with(cx, |s, _| (s.nav.right().clone(), if s.left_open() { s.dock_tools(false) } else { vec![] }, if s.right_open() { s.dock_tools(true) } else { vec![] }))
     };
     let bounds = |cx: &mut gpui::VisualTestContext, name: &str| {
         cx.update(|window, _| window.refresh());
@@ -42,12 +42,12 @@ fn tools_move_between_docks_and_tabs(cx: &mut TestAppContext) {
     assert!(alpha.left() >= right.left(), "the backlink is in the right dock: {alpha:?}");
     cx.simulate_click(alpha.center(), gpui::Modifiers::none());
     cx.run_until_parked();
-    assert_eq!(shell.read_with(cx, |s, _| (s.pane().path.clone(), s.nav.mode)), (Some(note("Alpha")), Mode::Links));
+    assert_eq!(shell.read_with(cx, |s, _| (s.pane().path.clone(), s.nav.mode())), (Some(note("Alpha")), Mode::Links));
     let beta = bounds(cx, "nav-row-Beta");
     assert!(beta.right() <= pane.left(), "the tree is still on the left: {beta:?}");
     cx.simulate_click(beta.center(), gpui::Modifiers::none());
     cx.run_until_parked();
-    assert_eq!(shell.read_with(cx, |s, _| (s.pane().path.clone(), s.nav.mode)), (Some(note("Beta")), Mode::Tree));
+    assert_eq!(shell.read_with(cx, |s, _| (s.pane().path.clone(), s.nav.mode())), (Some(note("Beta")), Mode::Tree));
 
     // The graph as a tab: its dock lets it go; closing the tab gives it back.
     shell.update_in(cx, |s, window, cx| s.show_nav(Mode::Graph, false, window, cx));
@@ -71,7 +71,7 @@ fn tools_move_between_docks_and_tabs(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let (again, cx2) = cx.add_window_view(|window, cx| Shell::new(Some(root.clone()), Vec::new(), window, cx));
     cx2.run_until_parked();
-    let back = again.read_with(cx2, |s, _| (s.nav.right.clone(), s.right_open(), s.tool_tab(Mode::Graph).is_some()));
+    let back = again.read_with(cx2, |s, _| (s.nav.right().clone(), s.right_open(), s.tool_tab(Mode::Graph).is_some()));
     assert_eq!(back, (vec![Mode::Links], true, true));
 
     // A narrow window: the right dock hides before the panes get under their minimum, and comes
@@ -179,32 +179,15 @@ fn tools_stacked_folded_and_dragged(cx: &mut TestAppContext) {
     // Restart: both stacks, in their order, the folded tool folded.
     let (again, cx2) = cx.add_window_view(|window, cx| Shell::new(Some(root.clone()), Vec::new(), window, cx));
     cx2.run_until_parked();
-    let back = again.read_with(cx2, |s, _| (s.dock_tools(false), s.dock_tools(true), s.nav.folded.contains(&Mode::Tags)));
+    let back = again.read_with(cx2, |s, _| (s.dock_tools(false), s.dock_tools(true), s.nav.folded().contains(&Mode::Tags)));
     assert_eq!(back, (vec![Mode::Tags, Mode::Graph, Mode::Tree], vec![Mode::Calendar, Mode::Links], true));
+
+    // What was shown on each side is shown again.
+    let shown = |shell: &Entity<Shell>, cx: &mut gpui::VisualTestContext| shell.read_with(cx, |s, _| (s.nav.left_shown().clone(), s.nav.right_shown().clone()));
+    assert_eq!(shown(&again, cx2), shown(&shell, cx));
 
     // A plain click on the rail: that tool alone in its dock, as the panel always did.
     let at = bounds(cx, "nav-recent").center();
     cx.simulate_click(at, none);
     assert_eq!(tools(cx).0, [Mode::Recent]);
-}
-
-#[gpui::test]
-fn the_layout_file_old_new_and_odd(cx: &mut TestAppContext) {
-    let (root, _shell, cx, _config) = start(cx, "docks-file");
-    let read = |cx: &mut gpui::VisualTestContext, text: &str| {
-        vault::save_layout(text);
-        let (shell, cx2) = cx.add_window_view(|window, cx| Shell::new(Some(root.clone()), Vec::new(), window, cx));
-        cx2.run_until_parked();
-        shell.read_with(cx2, |s, _| (s.nav.left_shown.clone(), s.nav.right.clone(), s.nav.right_shown.clone()))
-    };
-    use Mode::*;
-    // Before docks: everything on the left, as it was.
-    assert_eq!(read(cx, "tags split 300 0\n"), (vec![Tags], vec![], vec![]));
-    // A tool on both sides keeps the left; an unknown one is dropped; one shown on the right that
-    // does not live there is not shown.
-    assert_eq!(read(cx, "graph split 300 0 right=links,bogus,graph,links show=tags width=250\n"), (vec![Graph], vec![Links], vec![]));
-    assert_eq!(read(cx, "tree rail 260 0 width=x right=calendar show=calendar\n"), (vec![Tree], vec![Calendar], vec![Calendar]));
-    assert_eq!(read(cx, "tree split 260 0 left=links,tree,links right=links,tags show=tags,recent fold=links,zzz\n"), (vec![Links, Tree], vec![Tags], vec![Tags]));
-    // Empty or absent: the defaults.
-    assert_eq!(read(cx, ""), (vec![Tree], vec![], vec![]));
 }

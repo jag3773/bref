@@ -1,5 +1,6 @@
 //! Back and forward, shortcuts shown in menus, two panes.
 
+use crate::platform::config;
 use super::*;
 
 pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
@@ -60,7 +61,7 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
         // A preview does not enter the history: "back" returns to where we came from, and
         // "forward" still leads to the table.
     shell.update_in(cx, |s, window, cx| {
-        window.focus(&s.nav.focus);
+        window.focus(s.nav.focus());
         s.preview_note(&hist_b, window, cx);
     });
     assert_eq!(seen(cx), on_note(&hist_b));
@@ -174,8 +175,7 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
     assert!(shell.read_with(cx, |s, _| s.pane_showing(&shelf.join("Pane A.md")).is_some() && s.pane_showing(&pane("A")).is_none()));
         // Dragging a note from the tree onto a pane opens it there; the targeted half is tinted.
     shell.update(cx, |s, cx| {
-        s.nav.show_alone(nav::Mode::Tree);
-        s.nav.panel = nav::Panel::Split;
+        s.show_panel(nav::Mode::Tree, nav::Panel::Split, cx);
         cx.notify();
     });
     cx.run_until_parked();
@@ -219,7 +219,7 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) {
     cx.simulate_mouse_up(half, MouseButton::Left, gpui::Modifiers::none());
     assert_eq!(shown(cx), sides(1, &["D", "B"]));
         // The layout is remembered: the width, and what each pane shows.
-    assert_eq!(vault::load_file("panes"), format!("v3 row(0.5 0, 0.5 1)\n*{}\n*{}\n", pane("D").display(), pane("B").display()));
+    assert_eq!(config::load(config::File::Panes), format!("v3 row(0.5 0, 0.5 1)\n*{}\n*{}\n", pane("D").display(), pane("B").display()));
     cx.simulate_keystrokes("secondary-w");
-    assert_eq!(vault::load_file("panes"), format!("v3 0\n*{}\n", pane("D").display()));
+    assert_eq!(config::load(config::File::Panes), format!("v3 0\n*{}\n", pane("D").display()));
 }

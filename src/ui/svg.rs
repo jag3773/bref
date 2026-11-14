@@ -8,7 +8,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::logic::xml;
 use resvg::{tiny_skia, usvg};
+
+use crate::ui::assets::Fonts;
 use usvg::roxmltree::{self, Node};
 
 /// Maximum side of an image sent to the GPU: 8,192 px work everywhere.
@@ -18,28 +21,38 @@ pub const MAX_PIXELS: f32 = 16e6;
 
 /// System fonts and the app's; a missing font (Helvetica, Arial on
 /// Linux…) is replaced by the app's text font, never by whichever comes first.
-pub fn fonts() -> Arc<usvg::fontdb::Database> {
-    static DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+/// Building it is expensive: it is kept, and rebuilt only when the fonts of the settings change.
+pub fn fonts((sans, mono): Fonts) -> Arc<usvg::fontdb::Database> {
+    static CACHE: Mutex<Option<((&str, &str), Arc<usvg::fontdb::Database>)>> = Mutex::new(None);
+    let mut slot = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    refreshed(&mut slot, (sans, mono), || {
         let mut db = usvg::fontdb::Database::new();
         // The app's fonts first: for an equal name, they come before the system's, which are
         // reread from disk for each piece of text (ten times slower).
         crate::ui::assets::FONT_FILES.iter().for_each(|data| db.load_font_data(data.to_vec()));
         db.load_system_fonts();
-        db.set_sans_serif_family(crate::ui::assets::sans());
-        db.set_serif_family(crate::ui::assets::sans());
-        db.set_monospace_family(crate::ui::assets::mono());
+        db.set_sans_serif_family(sans);
+        db.set_serif_family(sans);
+        db.set_monospace_family(mono);
         Arc::new(db)
-    });
-    DB.clone()
+    })
 }
 
-fn options() -> usvg::Options<'static> {
-    usvg::Options { fontdb: fonts(), ..Default::default() }
+/// The value kept in `slot` for `key`, built (and kept) when the key changed.
+fn refreshed<K: PartialEq + Copy, V: Clone>(slot: &mut Option<(K, V)>, key: K, build: impl FnOnce() -> V) -> V {
+    match slot {
+        Some((k, v)) if *k == key => v.clone(),
+        _ => slot.insert((key, build())).1.clone(),
+    }
+}
+
+fn options(fonts_in_use: Fonts) -> usvg::Options<'static> {
+    usvg::Options { fontdb: fonts(fonts_in_use), ..Default::default() }
 }
 
 /// The SVG tree, ready to draw; `None` if it is unreadable.
-pub fn parse(svg: &str) -> Option<usvg::Tree> {
-    usvg::Tree::from_str(svg, &options()).ok()
+pub fn parse(svg: &str, fonts: Fonts) -> Option<usvg::Tree> {
+    usvg::Tree::from_str(svg, &options(fonts)).ok()
 }
 
 /// The scale at which to rasterize a `w`×`h` image to show it `want` times larger
@@ -290,18 +303,14 @@ fn tspan(text: &str, s: &Style) -> String {
     s.strike.then(|| deco.push("line-through"));
     format!(
         r#"<tspan font-family="{}" font-size="{}" font-weight="{}" font-style="{}" fill="{}"{}>{}</tspan>"#,
-        escape(&s.family),
+        xml::attr(&s.family),
         s.size,
         if s.bold { "bold" } else { "normal" },
         if s.italic { "italic" } else { "normal" },
-        escape(&s.color),
+        xml::attr(&s.color),
         if deco.is_empty() { String::new() } else { format!(r#" text-decoration="{}""#, deco.join(" ")) },
-        escape(text),
+        xml::attr(text),
     )
-}
-
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// The pieces of text under `node`, in order, with their style.
@@ -474,7 +483,7 @@ fn measure<'a>(words: impl Iterator<Item = &'a (String, Style)>) -> Vec<f32> {
         }
         svg.push_str("</svg>");
         let mut found = vec![None; missing.len()];
-        if let Some(tree) = parse(&svg) {
+        if let Some(tree) = parse(&svg, crate::ui::assets::APP_FONTS) {
             for node in tree.root().children() {
                 if let usvg::Node::Text(text) = node
                     && let Some(n) = text.id().strip_prefix('m').and_then(|n| n.parse::<usize>().ok())
@@ -494,6 +503,16 @@ fn measure<'a>(words: impl Iterator<Item = &'a (String, Style)>) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fonts_are_rebuilt_only_when_the_setting_changes() {
+        let (mut slot, mut built) = (None, 0);
+        let mut get = |key| super::refreshed(&mut slot, key, || { built += 1; built });
+        assert_eq!((get(("a", "m")), get(("a", "m"))), (1, 1));
+        assert_eq!(get(("b", "m")), 2);
+        assert_eq!(get(("b", "n")), 3);
+        assert_eq!(get(("b", "n")), 3);
+    }
+
     use super::*;
 
     #[test]
@@ -536,7 +555,7 @@ mod tests {
         let (first, last) = (found[0].1, found[found.len() - 1].1);
         assert!(first < 100. && last > 100. && ((first + last) / 2. - 100.).abs() < 8., "{first} {last}");
         // Each line fits in the box's 118 px, centered on its middle (100).
-        let tree = parse(&svg).unwrap();
+        let tree = parse(&svg, crate::ui::assets::APP_FONTS).unwrap();
         for node in tree.root().children() {
             if let usvg::Node::Text(t) = node {
                 let b = t.bounding_box();
@@ -584,7 +603,7 @@ mod tests {
         assert!(scale_for(1262., 6253., 2.) * 6253. <= MAX_SIDE);
         assert!(scale_for(20000., 20000., 2.).powi(2) * 4e8 <= MAX_PIXELS * 1.001);
         assert!(scale_for(0., 0., 2.) > 0.);
-        let tree = parse(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect x="2" width="2" height="2" fill="#ff0000"/></svg>"##).unwrap();
+        let tree = parse(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect x="2" width="2" height="2" fill="#ff0000"/></svg>"##, crate::ui::assets::APP_FONTS).unwrap();
         let bmp = bmp(&tree, 1., (0, 0, 4, 2), [0, 0, 255]).unwrap();
         // 54-byte header, 12-byte rows: blue background on the left, red on the right (in BGR).
         assert_eq!(bmp.len(), 54 + 2 * 12);

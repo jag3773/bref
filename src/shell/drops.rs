@@ -81,7 +81,7 @@ impl Shell {
         }
         self.rescan(root, cx);
         if let Some(first) = done.first() {
-            self.nav.open.insert(dir.to_path_buf());
+            self.nav.open_dir(dir.to_path_buf());
             self.nav.reveal(&first.to);
         }
         if let Aim::Note { pane, at, version } = aim {
@@ -123,8 +123,8 @@ impl Shell {
     pub(super) fn note_aim(&self, pane: usize, at: Point<Pixels>, items: usize, cx: &App) -> Option<DropAim> {
         let shown = self.panes.get(pane)?;
         let editor = shown.editor.read(cx);
-        let board = kanban::is_board(editor.text()) && !shown.board.text;
-        let writes = shown.file.is_none() && shown.listing.is_none() && !board && self.vault.is_some();
+        let board = kanban::is_board(editor.text()) && !shown.board.shows_text();
+        let writes = shown.shows_note() && !board && self.vault.is_some();
         writes.then(|| DropAim { aim: Aim::Note { pane, at: editor.drop_point(at), version: editor.revision() }, items, pointer: at })
     }
 
@@ -157,7 +157,7 @@ impl Shell {
                 .bg(t.panel)
                 .border_1()
                 .border_color(t.accent.opacity(0.6))
-                .text_size(px(12.))
+                .text_size(t.font_small())
                 .text_color(t.text)
                 .flex()
                 .gap_1()

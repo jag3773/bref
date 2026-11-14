@@ -1,10 +1,10 @@
 //! What a `[[link]]` means in a vault: which note it names, which notes point back at one,
 //! and when a rename must leave the links alone. Pure: the shell does the writing.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use super::markdown::{self, Link};
-use super::note::Note;
+use super::note::{Note, NoteKey};
 
 /// The note a `[[link]]` points to: by its name first, otherwise by an alias.
 /// A template answers no link (`template` says which notes are templates).
@@ -13,13 +13,28 @@ pub fn resolve<'a>(
     name: &str,
     template: impl Fn(&Note) -> bool,
 ) -> Option<&'a Note> {
-    let wanted = name.to_lowercase();
+    let wanted = NoteKey::of(name);
     let live = |n: &&Note| !template(n);
     notes
         .iter()
         .filter(live)
-        .find(|n| n.name.to_lowercase() == wanted)
+        .find(|n| NoteKey::of(&n.name) == wanted)
         .or_else(|| notes.iter().filter(live).find(|n| n.answers(&wanted)))
+}
+
+/// Every key a `[[link]]` can use (lowercase name or alias) with the position of the note it
+/// reaches, in the order of `resolve`: a name before an alias, the first note on a tie.
+pub fn by_key<'a>(notes: impl Iterator<Item = &'a Note> + Clone) -> HashMap<NoteKey, usize> {
+    let mut keys = HashMap::new();
+    for (i, note) in notes.clone().enumerate() {
+        keys.entry(NoteKey::of(&note.name)).or_insert(i);
+    }
+    for (i, note) in notes.enumerate() {
+        for alias in note.aliases.iter() {
+            keys.entry(NoteKey::of(alias)).or_insert(i);
+        }
+    }
+    keys
 }
 
 /// Backlinks: the notes whose `[[wikilink]]` targets note `target`, by name order. When two
@@ -48,7 +63,7 @@ pub fn link_line<'a>(body: &'a str, aimed: &Note) -> Option<&'a str> {
     body.lines().find(|line| {
         let links = markdown::links(line);
         links.iter().any(
-            |(_, link)| matches!(link, Link::Wiki(name) if aimed.answers(&name.to_lowercase())),
+            |(_, link)| matches!(link, Link::Wiki(name) if aimed.answers(&NoteKey::of(name))),
         )
     })
 }
@@ -58,8 +73,8 @@ pub fn link_line<'a>(body: &'a str, aimed: &Note) -> Option<&'a str> {
 /// note is still called `old` (the links may be meant for it). The renamed note itself must
 /// already bear `new` in `notes`.
 pub fn relink_set<'a>(notes: &'a [Note], old: &str, new: &str) -> Option<Vec<&'a Note>> {
-    let key = old.to_lowercase();
-    if key == new.to_lowercase() || notes.iter().any(|n| n.name.to_lowercase() == key) {
+    let key = NoteKey::of(old);
+    if key == NoteKey::of(new) || notes.iter().any(|n| NoteKey::of(&n.name) == key) {
         return None;
     }
     Some(notes.iter().filter(|n| n.links.contains(&key)).collect())
@@ -75,11 +90,10 @@ mod tests {
             name: name.into(),
             path: PathBuf::from(format!("/v/{name}.md")),
             tags: Arc::from([]),
-            links: links.iter().map(|l| (*l).to_string()).collect(),
+            links: links.iter().map(|l| NoteKey::of(l)).collect(),
             aliases: Arc::from([]),
             mtime: SystemTime::UNIX_EPOCH,
             body: "".into(),
-            lower: "".into(),
         }
     }
 
@@ -118,6 +132,22 @@ mod tests {
             link_line("vu [[bref app]]", &notes[0]),
             Some("vu [[bref app]]")
         );
+    }
+
+    #[test]
+    fn keys_follow_resolve_order() {
+        let mut notes = vec![note("Autre", &[]), note("Cible", &[]), note("Cible", &[])];
+        notes[0].aliases = vec!["Cible".into(), "Pseudo".into()].into();
+        notes[1].aliases = vec!["pseudo".into()].into();
+        let keys = by_key(notes.iter());
+        // The name of a note beats the alias of another, whatever their order; the first of two names wins.
+        assert_eq!(keys[&NoteKey::of("cible")], 1);
+        // Two aliases alike: the first note.
+        assert_eq!(keys[&NoteKey::of("pseudo")], 0);
+        for key in ["cible", "pseudo", "autre"] {
+            assert_eq!(resolve(&notes, key, |_| false).map(|n| &n.path), Some(&notes[keys[&NoteKey::of(key)]].path), "{key}");
+        }
+        assert!(by_key([].into_iter()).is_empty());
     }
 
     #[test]

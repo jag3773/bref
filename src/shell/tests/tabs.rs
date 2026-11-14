@@ -1,5 +1,6 @@
 //! Tabs: several files open in a pane, one shown, reached and closed from the keys, kept at restart.
 
+use crate::platform::config;
 use super::*;
 
 /// The tabs of pane `group`, by file, and the index of the one shown.
@@ -139,7 +140,7 @@ fn tabs_open_switch_close_and_come_back(cx: &mut TestAppContext) {
 
     // The tabs come back at the next start, in their order, the shown one shown; a file gone
     // since is dropped without a word.
-    let saved = vault::load_file("panes");
+    let saved = config::load(config::File::Panes);
     assert!(saved.starts_with("v3 0\n") && saved.contains(&format!("{}\t{}", note("Alpha").display(), root.join("Ici/Plan.md").display())), "{saved}");
     fs::remove_file(root.join("Ici/Plan.md")).unwrap();
     let recent = vec![note("Gamma")];
@@ -153,7 +154,6 @@ fn tabs_open_switch_close_and_come_back(cx: &mut TestAppContext) {
     let tab = again.read_with(cx2, |s, _| s.groups[0].tabs[31]);
     let last = cx2.debug_bounds(leak(format!("tab-{tab}"))).unwrap();
     assert!(last.right() <= bar.right() + px(0.5), "{last:?} out of {bar:?}");
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The arrows in the tree preview notes in a single tab, in italics, that the next note browsed
@@ -172,7 +172,7 @@ fn the_tree_previews_in_a_single_tab(cx: &mut TestAppContext) {
     let browse = |name: &str, cx: &mut gpui::VisualTestContext| shell.update_in(cx, |s, window, cx| s.preview_note(&note(name), window, cx));
 
     // Beta, then Gamma, browsed from the tree: one preview tab, the opened note stays where it was.
-    shell.update_in(cx, |s, window, _| window.focus(&s.nav.focus));
+    shell.update_in(cx, |s, window, _| window.focus(s.nav.focus()));
     browse("Beta", cx);
     assert_eq!(tabs(&shell, cx, 0), (all(&["Alpha", "Beta"]), 1));
     assert!(preview(&shell, cx));
@@ -202,7 +202,6 @@ fn the_tree_previews_in_a_single_tab(cx: &mut TestAppContext) {
     shell.update_in(cx, |s, window, cx| s.open(&root.join("rapport.pdf"), window, cx));
     assert_eq!(tabs(&shell, cx, 0).0.len(), 4);
     assert_eq!(shell.read_with(cx, |s, _| s.opened.last().cloned()), Some(root.join("rapport.pdf")));
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The bar is a row of pills on the ground: twelve tabs with long titles (one without a space), at 420, 860 and
@@ -210,9 +209,7 @@ fn the_tree_previews_in_a_single_tab(cx: &mut TestAppContext) {
 /// of the window buttons, and the row stops before the buttons.
 #[gpui::test]
 fn tabs_are_pills_that_stay_clear_of_the_window_buttons(cx: &mut TestAppContext) {
-    let root = std::env::temp_dir().join(format!("bref-tab-pills-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+    let root = TempDir::new("tab-pills");
     let _config = isolated_config(&root);
     cx.update(bind_keys);
     cx.update(init_fonts);
@@ -273,7 +270,6 @@ fn tabs_are_pills_that_stay_clear_of_the_window_buttons(cx: &mut TestAppContext)
             }
         }
     }
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// A failed atomic write must leave the actual editor alive, including its undo history.
@@ -291,7 +287,7 @@ fn failed_save_keeps_the_tab_and_its_edits(cx: &mut TestAppContext) {
         s.open_from_nav(&beta, window, cx);
         s.open_from_nav(&alpha, window, cx);
     });
-    fs::create_dir(root.join(".Alpha.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Alpha.md"), true);
     cx.simulate_keystrokes("secondary-end");
     cx.simulate_input(" UNSAVED CHANGES");
     let editor = shell.read_with(cx, |s, _| s.pane().editor.clone());
@@ -309,13 +305,12 @@ fn failed_save_keeps_the_tab_and_its_edits(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("secondary-z");
     assert_ne!(editor.read_with(cx, |e, _| e.text().to_string()), format!("{original} UNSAVED CHANGES"));
     cx.simulate_keystrokes("secondary-shift-z");
-    fs::remove_dir(root.join(".Alpha.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Alpha.md"), false);
     cx.simulate_keystrokes("secondary-w");
     assert_eq!(fs::read_to_string(&alpha).unwrap(), format!("{original} UNSAVED CHANGES"));
     assert!(!shell.read_with(cx, |s, _| s.panes.iter().any(|p| p.editor == editor)));
     cx.simulate_keystrokes("secondary-alt-t");
     assert_eq!(shell.read_with(cx, |s, cx| s.pane().editor.read(cx).text().to_string()), format!("{original} UNSAVED CHANGES"));
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Right click on a tab, or the palette: close it, the others, the pane or every file. Each tab is
@@ -393,7 +388,7 @@ fn tabs_close_in_bulk_from_their_menu(cx: &mut TestAppContext) {
 
     // Close all files with a failed save among them: that tab stays, with its text; the others close.
     open(cx, &note("Alpha"));
-    fs::create_dir(root.join(".Alpha.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Alpha.md"), true);
     cx.simulate_keystrokes("secondary-end");
     cx.simulate_input("non enregistré");
     let editor = shell.read_with(cx, |s, _| s.pane().editor.clone());
@@ -403,7 +398,7 @@ fn tabs_close_in_bulk_from_their_menu(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("secondary-n");
     shell.update_in(cx, |s, window, cx| { s.add_pane(Side::Right, window, cx); });
     open(cx, &note("Gamma"));
-    fs::create_dir(root.join(".Gamma.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Gamma.md"), true);
     cx.simulate_keystrokes("secondary-end");
     cx.simulate_input("aussi");
     let gamma = shell.read_with(cx, |s, _| s.pane().editor.clone());
@@ -424,13 +419,13 @@ fn tabs_close_in_bulk_from_their_menu(cx: &mut TestAppContext) {
     assert_eq!(files(&root), before, "closing neither deletes nor adds a file");
 
     // Once it can be saved, closing all leaves a single new empty note, at restart too.
-    fs::remove_dir(root.join(".Alpha.tmp")).unwrap();
-    fs::remove_dir(root.join(".Gamma.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Alpha.md"), false);
+    crate::platform::vault::refuse_writes(&root.join("Gamma.md"), false);
     cx.dispatch_action(CloseAllFiles);
     cx.run_until_parked();
     shell.read_with(cx, |s, cx| {
         assert_eq!((s.panes.len(), s.groups.len()), (1, 1));
-        assert!(s.pane().path.is_none() && s.pane().file.is_none() && s.pane().tool.is_none());
+        assert!(s.pane().path.is_none() && s.pane().file().is_none() && s.pane().tool().is_none());
         assert!(s.pane().editor.read(cx).text().is_empty());
     });
     assert!(fs::read_to_string(note("Alpha")).unwrap().ends_with("non enregistré"));
@@ -465,7 +460,6 @@ fn tabs_close_in_bulk_from_their_menu(cx: &mut TestAppContext) {
     let path = shell.read_with(cx, |s, _| s.panes[kept].path.clone());
     shell.update_in(cx, |s, window, cx| s.close_other_tabs(kept, window, cx));
     shell.read_with(cx, |s, _| assert_eq!((s.panes.len(), s.pane().path.clone()), (1, path)));
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Closing in bulk over a diagram, a picture and a table whose cell is still typed, its save
@@ -490,8 +484,8 @@ fn bulk_close_writes_pending_tables_and_diagrams(cx: &mut TestAppContext) {
         open(cx, path);
     }
     // A shape drawn in the diagram, which cannot be written (it saves as soon as it is drawn).
-    let block = root.join(".Schéma.tmp");
-    fs::create_dir(&block).unwrap();
+    let block = root.join("Schéma.svg");
+    crate::platform::vault::refuse_writes(&block, true);
     open(cx, &drawing);
     let canvas = shell.read_with(cx, |s, _| s.pane().drawing().cloned().unwrap());
     let draw = |cx: &mut gpui::VisualTestContext| {
@@ -520,19 +514,18 @@ fn bulk_close_writes_pending_tables_and_diagrams(cx: &mut TestAppContext) {
     assert_eq!(canvas.read_with(cx, |c, _| c.diagram().shapes.len()), 1);
 
     // Writable again: it is saved, the window is left on an empty note, every file still there.
-    fs::remove_dir(&block).unwrap();
+    crate::platform::vault::refuse_writes(&block, false);
     cx.dispatch_action(CloseAllFiles);
     cx.run_until_parked();
     assert_eq!(Diagram::from_svg(&fs::read_to_string(&drawing).unwrap()).unwrap().shapes.len(), 1);
     shell.read_with(cx, |s, cx| {
         assert_eq!(s.panes.len(), 1);
-        assert!(s.pane().path.is_none() && s.pane().file.is_none() && s.pane().editor.read(cx).text().is_empty());
+        assert!(s.pane().path.is_none() && s.pane().file().is_none() && s.pane().editor.read(cx).text().is_empty());
     });
     assert!(anchor.is_file() && image.is_file() && csv.is_file() && drawing.is_file());
     // They come back the last closed first, the picture too; the first one takes the empty note's place.
     cx.simulate_keystrokes("secondary-alt-t secondary-alt-t secondary-alt-t");
     cx.run_until_parked();
     assert_eq!(shell.read_with(cx, |s, cx| s.tab_labels(0, cx)), vec!["Schéma", "Données", "Photo"]);
-    assert!(shell.read_with(cx, |s, _| matches!(s.pane().file.as_ref().map(|f| &f.kind), Some(FileKind::Image))));
-    let _ = fs::remove_dir_all(&root);
+    assert!(shell.read_with(cx, |s, _| matches!(s.pane().file().map(|f| &f.kind), Some(FileKind::Image))));
 }

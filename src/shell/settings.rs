@@ -1,11 +1,11 @@
 //! Settings: theme, fonts, text size and the other choices of the palette.
 
+use crate::platform::config;
 use super::*;
 
 impl Shell {
     /// Applies the appearance settings to the whole window.
     pub(super) fn restyle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        apply_fonts(&self.prefs);
         let theme = Theme::of(&self.prefs, window.appearance());
         self.theme = theme;
         for pane in &self.panes {
@@ -13,6 +13,9 @@ impl Shell {
         }
         if let Some(palette) = &self.palette {
             palette.update(cx, |p, cx| p.set_theme(theme, cx));
+        }
+        if let Some(find) = &self.settings.find {
+            find.update(cx, |f, cx| f.set_theme(theme, cx));
         }
         cx.notify();
     }
@@ -82,7 +85,7 @@ impl Shell {
             if !matches!(event, PaletteEvent::Preview(_)) {
                 this.palette = None;
                 window.focus(&this.pane().editor.focus_handle(cx));
-                vault::save_settings(&this.prefs.to_text());
+                this.keep(config::File::Settings, &this.prefs.to_text(), cx);
             }
             this.restyle(window, cx);
         })
@@ -96,7 +99,7 @@ impl Shell {
     pub(super) fn resize_text(&mut self, by: Option<f32>, window: &mut Window, cx: &mut Context<Self>) {
         let size = by.map_or(Prefs::SIZE, |by| self.prefs.size + by);
         self.prefs = Prefs::parse(&Prefs { size, ..self.prefs.clone() }.to_text());
-        vault::save_settings(&self.prefs.to_text());
+        self.keep(config::File::Settings, &self.prefs.to_text(), cx);
         self.restyle(window, cx);
     }
 }

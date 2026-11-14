@@ -14,8 +14,10 @@ mod hold;
 mod pick;
 mod place;
 mod route;
+mod scene;
 mod sequence;
 pub use place::{fit, layered};
+pub use scene::{Fill, Item, Label};
 use sequence::Flow;
 
 /// Stroke colors, as `0xrrggbb`: mid tones, readable on a light background
@@ -29,7 +31,9 @@ pub const FONT: f32 = 14.;
 pub const LINE: f32 = 18.;
 /// Distance between arrows that run side by side between the same two shapes.
 const SPREAD: f32 = 18.;
-/// Height of the header of a swimlane.
+/// Height of the header of a swimlane. `Form::header` returns it for the forms that have one; the two
+/// outlines (`Lane`, `Composite`) draw their rule at this constant directly rather than through
+/// `header()`, because they are already inside the match arm of the form that has it.
 pub const LANE: f32 = 26.;
 /// Width of the header of a horizontal swimlane, where its name is written.
 pub const ROW: f32 = 100.;
@@ -105,6 +109,56 @@ pub enum Form {
 }
 
 impl Form {
+    /// Size of a new shape of this form: the one source for the canvas, the library, Mermaid and MCP.
+    pub fn default_size(self) -> (f32, f32) {
+        match self {
+            Form::Text => (80., LINE),
+            Form::Actor => (40., 80.),
+            Form::Cylinder => (80., 100.),
+            Form::Branch => (40., 40.),
+            Form::Package => (220., 150.),
+            Form::Frame => (260., 170.),
+            Form::Lane => (160., 320.),
+            Form::Ellipse | Form::Diamond => (120., 80.),
+            Form::Lifeline => (110., 276.),
+            Form::Dot => (20., 20.),
+            Form::Final => (26., 26.),
+            Form::Pin => (14., 14.),
+            Form::Bar => (90., 8.),
+            Form::Exit | Form::Terminate => (24., 24.),
+            Form::Divider => (200., 10.),
+            Form::Composite | Form::Node => (300., 200.),
+            Form::Row => (420., 140.),
+            Form::Fragment => (280., 140.),
+            _ => (140., 60.),
+        }
+    }
+
+    /// Whether the text is written under the shape rather than in it.
+    pub fn label_below(self) -> bool {
+        matches!(self, Form::Actor | Form::Branch | Form::Dot | Form::Final | Form::Terminate | Form::Bar | Form::Exit | Form::Pin)
+    }
+
+    /// Whether the outline has a corner radius to set (the inspector offers it).
+    pub fn round_outline(self) -> bool {
+        matches!(self, Form::Round | Form::Composite)
+    }
+
+    /// Height of the header where the name is written, for the forms that have one on top.
+    pub fn header(self) -> Option<f32> {
+        matches!(self, Form::Lane | Form::Composite).then_some(LANE)
+    }
+
+    /// The form a name in a file or an MCP call stands for.
+    pub fn named(name: &str) -> Option<Form> {
+        Form::ALL.iter().find(|(_, known)| *known == name).map(|(form, _)| *form)
+    }
+
+    /// The name of this form in a file and in MCP.
+    pub fn name(self) -> &'static str {
+        Form::ALL.iter().find(|(form, _)| *form == self).map_or("rect", |(_, name)| name)
+    }
+
     pub const ALL: [(Form, &str); 26] = [
         (Form::Rect, "rect"),
         (Form::Round, "round"),
@@ -696,8 +750,8 @@ impl Shape {
                     (Form::Row, i) => (self.x + ROW.min(self.w) + 8., self.y + 6. + LINE * (i - 1) as f32, false),
                     // In the front face of a node, under its top.
                     (Form::Node, i) => (self.x + 8., self.y + DEPTH.min(self.w / 3.).min(self.h / 3.) + 6. + LINE * i as f32, false),
-                    (Form::Lane | Form::Composite, 0) => (cx, self.y + (LANE - LINE) / 2., true),
-                    (Form::Lane | Form::Composite, i) => (self.x + 8., self.y + LANE + 6. + LINE * (i - 1) as f32, false),
+                    (f, 0) if f.header().is_some() => (cx, self.y + (LANE - LINE) / 2., true),
+                    (f, i) if f.header().is_some() => (self.x + 8., self.y + LANE + 6. + LINE * (i - 1) as f32, false),
                     (_, i) => (self.x + 8., self.y + 6. + LINE * i as f32, false),
                 };
                 out.push(TextLine { x, y, text, centered, bold: index == 0, index });
@@ -708,7 +762,7 @@ impl Shape {
         let (x, top, centered) = match self.form {
             Form::Text => (self.x, self.y, false),
             // Under the stick figure.
-            Form::Actor | Form::Branch | Form::Dot | Form::Final | Form::Terminate | Form::Bar | Form::Exit | Form::Pin => (cx, self.y + self.h + 4., true),
+            f if f.label_below() => (cx, self.y + self.h + 4., true),
             _ => (cx, cy - height / 2., true),
         };
         let placed = lines.into_iter().enumerate();
@@ -923,9 +977,14 @@ impl Diagram {
     }
 
     pub fn add_shape(&mut self, form: Form, x: f32, y: f32, w: f32, h: f32) -> u32 {
+        self.add_shape_mut(form, x, y, w, h).id
+    }
+
+    /// As `add_shape`, for a caller that sets the new shape up at once.
+    pub fn add_shape_mut(&mut self, form: Form, x: f32, y: f32, w: f32, h: f32) -> &mut Shape {
         let id = self.fresh();
         self.shapes.push(Shape { id, form, x, y, w, h, text: String::new(), color: 0, fill: false, dashed: false, parent: None, operand: 0 });
-        id
+        self.shapes.last_mut().expect("just pushed")
     }
 
     pub fn add_link(&mut self, from: End, to: End, end: Head, route: Route) -> u32 {
@@ -1337,7 +1396,7 @@ impl Diagram {
                 let tall = LINE * s.text.split('\n').count() as f32 + 4.;
                 return (s.x - room, s.y - tall, s.x + s.w + room, s.y + s.h + tall);
             }
-            let below = if matches!(s.form, Form::Actor | Form::Branch | Form::Dot | Form::Final | Form::Terminate | Form::Bar | Form::Exit | Form::Pin) { 4. + LINE * s.text.split('\n').count() as f32 } else { 0. };
+            let below = if s.form.label_below() { 4. + LINE * s.text.split('\n').count() as f32 } else { 0. };
             (s.x, s.y, s.x + s.w, s.y + s.h + below)
         });
         let drawn = || self.links.iter().zip(traces).filter_map(|(l, t)| Some((l, t.as_ref()?)));
@@ -1685,5 +1744,19 @@ mod tests {
         assert!(!d.reverse(999) && !d.reverse(a));
         let held = d.add_link(End::Shape(a), End::Mid(id), Head::None, Route::Straight);
         assert!(!d.reverse(held));
+    }
+}
+
+#[cfg(test)]
+mod default_size_tests {
+    use super::*;
+
+    #[test]
+    fn one_default_size_for_every_source() {
+        assert_eq!(Form::Lifeline.default_size(), (110., 276.));
+        assert_eq!(Form::Package.default_size(), (220., 150.));
+        let p = |form| crate::logic::library::presets().into_iter().find(|p| p.form == form).map(|p| (p.w, p.h));
+        assert_eq!(p(Form::Lifeline), Some(Form::Lifeline.default_size()));
+        assert_eq!(p(Form::Package), Some(Form::Package.default_size()));
     }
 }

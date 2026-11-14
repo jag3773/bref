@@ -241,11 +241,9 @@ fn class(lines: &[&str]) -> Converted {
     let (at, _) = layered(&sizes, &edges);
     let ids: Vec<u32> = (0..classes.len())
         .map(|i| {
-            let id = d.add_shape(Form::Rect, at[i].0, at[i].1, sizes[i].0, sizes[i].1);
-            if let Some(shape) = d.shape_mut(id) {
-                shape.text = lines[i].join("\n");
-            }
-            id
+            let shape = d.add_shape_mut(Form::Rect, at[i].0, at[i].1, sizes[i].0, sizes[i].1);
+            shape.text = lines[i].join("\n");
+            shape.id
         })
         .collect();
     for rel in links {
@@ -367,13 +365,11 @@ fn sequence(lines: &[&str]) -> Converted {
     let lives: Vec<u32> = names
         .iter()
         .map(|(_, label)| {
-            let w = (Diagram::guess_width(label) + 28.).max(110.).ceil();
-            let id = d.add_shape(Form::Lifeline, snap(x), 30., w, 276.);
+            let w = (Diagram::guess_width(label) + 28.).max(Form::Lifeline.default_size().0).ceil();
+            let shape = d.add_shape_mut(Form::Lifeline, snap(x), 30., w, Form::Lifeline.default_size().1);
+            shape.text = label.clone();
             x += w + 110.;
-            if let Some(shape) = d.shape_mut(id) {
-                shape.text = label.clone();
-            }
-            id
+            shape.id
         })
         .collect();
     let ids: Vec<u32> = messages
@@ -414,7 +410,7 @@ fn sequence(lines: &[&str]) -> Converted {
             }
         }
     }
-    d.fit_sequence();
+    d.normalise();
     Converted { diagram: d, skipped }
 }
 
@@ -534,12 +530,11 @@ impl States {
                 Node::State if node.holds => Form::Composite,
                 Node::State => Form::Round,
             };
-            let id = d.add_shape(form, snap(x + dx), snap(y + dy), w, h);
-            if matches!(node.kind, Node::State)
-                && let Some(shape) = d.shape_mut(id)
-            {
+            let shape = d.add_shape_mut(form, snap(x + dx), snap(y + dy), w, h);
+            if matches!(node.kind, Node::State) {
                 shape.text = self.lines(i).join("\n");
             }
+            let id = shape.id;
             if let Some(holder) = scope.and_then(|s| ids.get(&s)) {
                 d.set_parent(id, Some(*holder));
             }

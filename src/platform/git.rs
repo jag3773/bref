@@ -129,17 +129,9 @@ pub fn conflict_path(path: &Path, date: &str, host: &str) -> PathBuf {
 /// `conflict_path`, numbered when that name is taken: nothing is overwritten.
 pub fn free_conflict_path(path: &Path, date: &str, host: &str) -> PathBuf {
     let named = conflict_path(path, date, host);
-    let mut other = named.clone();
-    let mut n = 1;
-    while other.exists() {
-        n += 1;
-        let stem = named.file_stem().unwrap_or_default().to_string_lossy().to_string();
-        other = named.with_file_name(match named.extension() {
-            Some(extension) => format!("{stem} {n}.{}", extension.to_string_lossy()),
-            None => format!("{stem} {n}"),
-        });
-    }
-    other
+    let stem = named.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = named.extension().map(|e| e.to_string_lossy()).unwrap_or_default();
+    super::vault::free_path(named.parent().unwrap_or(Path::new("")), &stem, &extension)
 }
 
 /// What git wrote when failing, reduced to one sentence: a refused connection and an unreachable
@@ -222,6 +214,12 @@ pub fn linked(root: &Path) -> Result<bool, Fail> {
         return Err(Fail::Odd(Odd::Inside));
     }
     Ok(!run(root, &["remote"])?.is_empty())
+}
+
+/// The address the vault syncs with (its first remote), read locally: no network.
+pub fn remote(root: &Path) -> Option<String> {
+    let name = run(root, &["remote"]).ok()?.lines().next()?.to_string();
+    run(root, &["remote", "get-url", &name]).ok().filter(|url| !url.is_empty())
 }
 
 /// Refuses a repository in an unusual state, before touching it.
@@ -352,7 +350,7 @@ pub fn connect(root: &Path, url: &str) -> Result<(), Fail> {
     let known = std::fs::read_to_string(&ignore).unwrap_or_default();
     if !known.lines().any(|line| line.trim() == ".trash/") {
         let gap = if known.is_empty() || known.ends_with('\n') { "" } else { "\n" };
-        std::fs::write(&ignore, format!("{known}{gap}.trash/\n")).map_err(|e| Fail::Told(e.to_string()))?;
+        crate::platform::vault::write(&ignore, format!("{known}{gap}.trash/\n")).map_err(|e| Fail::Told(e.to_string()))?;
     }
     let verb = if run(root, &["remote"])?.lines().any(|name| name == "origin") { "set-url" } else { "add" };
     run(root, &["remote", verb, "origin", url])?;
@@ -399,6 +397,13 @@ mod tests {
         assert_eq!(conflict_path(Path::new("dir/Note.md"), "2026-10-09", "laptop"), Path::new("dir/Note (conflict 2026-10-09 laptop).md"));
         assert_eq!(conflict_path(Path::new("Note.md"), "2026-10-09", ""), Path::new("Note (conflict 2026-10-09).md"));
         assert_eq!(conflict_path(Path::new("sans extension"), "2026-10-09", "pc"), Path::new("sans extension (conflict 2026-10-09 pc)"));
+        // Vault health knows these copies by their name: keep the two in step.
+        for (host, stem) in [("laptop", "Note"), ("", "Mon (projet)")] {
+            let copy = conflict_path(&Path::new("dir").join(format!("{stem}.md")), "2026-10-09", host);
+            let copy = copy.file_stem().unwrap().to_string_lossy();
+            assert_eq!(crate::logic::health::conflict_of(&copy), Some(stem));
+            assert_eq!(crate::logic::health::conflict_of(&format!("{copy} 2")), Some(stem));
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    sync::{OnceLock, RwLock},
+    sync::OnceLock,
 };
 
 use gpui::{App, AssetSource, SharedString, prelude::*, px, svg};
@@ -12,8 +12,11 @@ use crate::{logic::prefs::Prefs, ui::theme::Theme};
 /// Installed fonts, collected at startup.
 pub static FAMILIES: OnceLock<Vec<&'static str>> = OnceLock::new();
 
-/// Fonts (text, code) in use: the chosen ones, otherwise the defaults.
-static FONTS: RwLock<(&str, &str)> = RwLock::new(("IBM Plex Sans", "IBM Plex Mono"));
+/// The fonts (text, code) drawn with: from the theme, or `APP_FONTS` where there is no theme.
+pub type Fonts = (&'static str, &'static str);
+
+/// The app's own fonts.
+pub const APP_FONTS: Fonts = ("IBM Plex Sans", "IBM Plex Mono");
 
 /// IBM Plex Sans and Plex Mono (SIL OFL license, `assets/fonts/`), in the binary: the app
 /// has its fonts without installing anything. Static fonts, because gpui 0.2 does not
@@ -31,17 +34,15 @@ pub const FONT_FILES: [&[u8]; 10] = [
     include_bytes!("../../assets/fonts/IBMPlexSerif-SemiBoldItalic.ttf"),
 ];
 
+/// Where each family starts in `FONT_FILES`: regular, italic, bold, bold italic (the serif: semibold and
+/// its italic). A face is found by `START + italic + 2 * bold`, never by a bare number.
+pub const SANS_AT: usize = 0;
+pub const MONO_AT: usize = 4;
+pub const SERIF_AT: usize = 8;
+
 /// IBM Plex Serif, bundled in SemiBold (600) and its italic only: for titles (note headings, panel and
 /// board titles), never body text. A view asks for it with `font(SERIF)` and `FontWeight::SEMIBOLD`.
 pub const SERIF: &str = "IBM Plex Serif";
-
-pub fn sans() -> &'static str {
-    FONTS.read().unwrap().0
-}
-
-pub fn mono() -> &'static str {
-    FONTS.read().unwrap().1
-}
 
 /// The app's fonts have no CJK glyphs, and gpui draws a box for them in an italic or monospace run (the
 /// regular and bold sans find a system font): such characters take the upright sans.
@@ -50,24 +51,24 @@ pub fn needs_system_font(c: char) -> bool {
 }
 
 pub fn init_fonts(cx: &mut App) {
-    cx.text_system().add_fonts(FONT_FILES.iter().map(|f| Cow::Borrowed(*f)).collect()).ok();
+    // The app still runs on system fonts, but the user should be able to learn why it looks different.
+    if let Err(e) = cx.text_system().add_fonts(FONT_FILES.iter().map(|f| Cow::Borrowed(*f)).collect()) {
+        eprintln!("bref: bundled fonts not loaded: {e}");
+    }
     FAMILIES.get_or_init(|| {
         let names: &'static [String] = cx.text_system().all_font_names().leak();
         names.iter().map(String::as_str).collect()
     });
 }
 
-/// Puts the settings' fonts in use (any installed font); failing that,
-/// the app's.
-pub fn apply_fonts(prefs: &Prefs) {
+/// The settings' fonts (any installed font); failing that, the app's: (text, code).
+pub fn chosen_fonts(prefs: &Prefs) -> Fonts {
     let installed = FAMILIES.get().map_or(&[][..], Vec::as_slice);
-    let pick = |chosen: &str, wanted: &[&'static str]| {
+    let pick = |chosen: &str, wanted: &'static str| {
         let known = |name: &str| installed.iter().copied().find(|i| *i == name);
-        known(chosen)
-            .or_else(|| wanted.iter().find_map(|w| known(w)))
-            .unwrap_or(wanted[0])
+        known(chosen).or_else(|| known(wanted)).unwrap_or(wanted)
     };
-    *FONTS.write().unwrap() = (pick(&prefs.font, &["IBM Plex Sans"]), pick(&prefs.mono, &["IBM Plex Mono"]));
+    (pick(&prefs.font, APP_FONTS.0), pick(&prefs.mono, APP_FONTS.1))
 }
 
 /// Icons embedded in the binary (1.2 px strokes on a 16 px grid).
@@ -248,6 +249,10 @@ impl AssetSource for Assets {
             "replace-all.svg" => r#"<path d="M2.5 3.5H7.5M2.5 7H7.5M2.5 10.5H7.5"/><path d="M9 3.5H10.5A2.5 2.5 0 0 1 13 6V12M10.8 10L13 12.2L15.2 10"/>"#,
             "in-selection.svg" => r#"<path d="M5 3H3.5V13H5M11 3H12.5V13H11"/><path d="M6 6.5H10M6 9.5H9"/>"#,
             "sync.svg" => r#"<path d="M12.6 6.5A4.8 4.8 0 0 0 3.9 5.4M3.5 2.8V5.6H6.3M3.4 9.5A4.8 4.8 0 0 0 12.1 10.6M12.5 13.2V10.4H9.7"/>"#,
+            // A toothed wheel: the settings.
+            "gear.svg" => {
+                r#"<circle cx="8" cy="8" r="2"/><path d="M6.9 2.5H9.1L9.5 4.1L10.9 4.9L12.5 4.4L13.6 6.3L12.4 7.4V8.6L13.6 9.7L12.5 11.6L10.9 11.1L9.5 11.9L9.1 13.5H6.9L6.5 11.9L5.1 11.1L3.5 11.6L2.4 9.7L3.6 8.6V7.4L2.4 6.3L3.5 4.4L5.1 4.9L6.5 4.1Z"/>"#
+            }
             "theme.svg" => {
                 r#"<circle cx="8" cy="8" r="5.5"/><path d="M8 2.5A5.5 5.5 0 0 1 8 13.5Z" fill="black"/>"#
             }
@@ -320,4 +325,24 @@ pub const ICON_SET: &[(&str, &str)] = &[
 /// The app logo, discreet: the two cards, in the accent color.
 pub fn logo(t: Theme) -> gpui::Svg {
     svg().path("logo.svg").size(px(15.)).flex_none().text_color(t.accent.opacity(0.85))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every bundled file parses, and each family starts where `SANS_AT`, `MONO_AT` and `SERIF_AT` say.
+    #[test]
+    fn bundled_fonts_parse_where_expected() {
+        for (i, data) in FONT_FILES.iter().enumerate() {
+            let face = ttf_parser::Face::parse(data, 0).unwrap_or_else(|e| panic!("font {i}: {e}"));
+            let name = face.names().into_iter().filter(|n| n.name_id == 1).find_map(|n| n.to_string()).unwrap();
+            let family = match i {
+                SANS_AT..MONO_AT => "IBM Plex Sans",
+                MONO_AT..SERIF_AT => "IBM Plex Mono",
+                _ => SERIF,
+            };
+            assert!(name.starts_with(family), "font {i}: {name}");
+        }
+    }
 }

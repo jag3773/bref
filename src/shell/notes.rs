@@ -1,13 +1,17 @@
 //! Notes: opening, previewing, creating, saving, renaming with their title, links and wikilinks.
 
+use crate::platform::config;
 use super::*;
+
+/// How long typing must pause before the note is saved.
+pub(super) const SAVE_DELAY: Duration = Duration::from_millis(400);
 
 impl Shell {
     /// Copies the whole note to the clipboard.
     /// Copies the note; with `block`, only the code block the cursor is in,
     /// if there is one.
     pub(super) fn copy_all(&mut self, block: bool, cx: &mut Context<Self>) {
-        if self.pane().file.is_some() || self.pane().tool.is_some() || self.pane().listing.is_some() || self.pane().figure.is_some() { return; }
+        if self.pane().file().is_some() || !self.pane().page() || self.pane().listed() || self.pane().figure().is_some() { return; }
         let editor = self.pane().editor.read(cx);
         let code = editor.code_at_cursor().filter(|_| block);
         let text = code.unwrap_or(editor.text()).to_string();
@@ -15,7 +19,7 @@ impl Shell {
         self.copied = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            cx.background_executor().timer(crate::ui::widgets::FLASH).await;
             this.update(cx, |this, cx| {
                 this.copied = false;
                 cx.notify();
@@ -34,14 +38,14 @@ impl Shell {
                 self.active = other;
                 if self.pane().path.as_deref() == Some(path) {
                     self.set_file(None, cx);
-                    self.pane_mut().listing = None;
+                    self.pane_mut().drop_pages();
                 }
                 self.grab = true;
                 cx.notify();
             }
             return false;
         }
-        self.pane_mut().listing = None;
+        self.pane_mut().drop_pages();
         // An attachment (PDF, video, archive…) opens in the system's application; the note stays.
         if vault::is_attachment(path) {
             // The test platform opens nothing: it records what it would have been asked.
@@ -57,7 +61,7 @@ impl Shell {
         // A picture takes the note's place; the note stays loaded underneath.
         if vault::is_image(path) {
             let svg = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"));
-            let open = self.pane().file.as_ref().filter(|file| file.path == path).map(|file| file.kind.clone());
+            let open = self.pane().file().filter(|file| file.path == path).map(|file| file.kind.clone());
             let theme = self.theme;
             let kind = match open {
                 _ if !svg => FileKind::Image,
@@ -103,8 +107,8 @@ impl Shell {
                 self.pane_mut().h1 = vault::h1_of(&text);
                 self.pane_mut().origin = Some(vault::stem(path));
                 // A reloaded note keeps its view; another one opens as a board if it is one.
-                self.pane_mut().board.text &= self.pane_mut().path.as_deref() == Some(path);
-                self.pane_mut().board.was = kanban::is_board(&text);
+                let same = self.pane_mut().path.as_deref() == Some(path);
+                self.pane_mut().board.reloaded(same, kanban::is_board(&text));
                 self.pane_mut().path = Some(path.to_path_buf());
                 self.pane_mut().base = text.clone();
                 self.calm();
@@ -151,7 +155,7 @@ impl Shell {
         self.pane_mut().peek = true;
         // The note already loaded, hidden by a picture: removing the picture is enough.
         if self.pane().path.as_deref() == Some(path) {
-            if self.pane().file.is_some() {
+            if self.pane().file().is_some() {
                 self.set_file(None, cx);
                 cx.notify();
             }
@@ -183,9 +187,7 @@ impl Shell {
         self.fresh_tab(window, cx);
         self.new_note(String::new(), cx);
         self.pane_mut().new_dir = dir;
-        if self.nav.panel == Panel::Full {
-            self.nav.panel = Panel::Split;
-        }
+        self.nav.give_note_room();
         window.focus(&self.pane().editor.focus_handle(cx));
         self.settle_nav(window, cx);
     }
@@ -195,7 +197,7 @@ impl Shell {
         if !self.leave(cx) {
             return;
         }
-        self.pane_mut().listing = None;
+        self.pane_mut().drop_pages();
         self.set_file(None, cx);
         self.pane_mut().path = None;
         self.pane_mut().origin = None;
@@ -204,7 +206,7 @@ impl Shell {
         self.pane_mut().new_dir = None;
         self.pane_mut().fresh = true;
         self.pane_mut().dirty = !text.is_empty();
-        (self.pane_mut().board.text, self.pane_mut().board.was) = (false, kanban::is_board(&text));
+        self.pane_mut().board.reloaded(false, kanban::is_board(&text));
         let cursor = text.len();
         self.pane().editor.update(cx, |e, cx| e.load(text, cursor, cx));
         self.push_dirs(cx);
@@ -247,16 +249,14 @@ impl Shell {
             return;
         };
         if fs::read_to_string(&path).is_ok_and(|text| text.trim().is_empty()) && fs::remove_file(&path).is_ok() {
-            self.notes.retain(|n| n.path != path);
+            self.forget_notes(|p| *p == path);
             self.recent.retain(|p| *p != path);
             if let Some(root) = &self.vault {
-                vault::save_config(root, &self.recent);
+                config::save_config(root, &self.recent);
             }
             self.history.remove(&path);
             self.pane_mut().path = None;
-            self.graph_stale = true;
-            self.push_names(cx);
-            self.refresh_graph(cx);
+            self.index_changed(cx);
         }
     }
 
@@ -266,25 +266,17 @@ impl Shell {
     // ponytail: synchronous rewrite, limited to the notes the index says link to
     // `old`; move to a background task if a note is linked from hundreds of others.
     pub(super) fn relink(&mut self, old: &str, new: &str, cx: &mut Context<Self>) -> bool {
-        let paths: Vec<PathBuf> = {
-            let Some(targets) = logic::wiki::relink_set(&self.notes, old, new) else {
-                return false;
-            };
-            targets.iter().map(|n| n.path.clone()).collect()
-        };
-        let mut changed = Vec::new();
-        for note in self.notes.iter_mut().filter(|n| paths.contains(&n.path)) {
-            let rewritten = fs::read_to_string(&note.path)
-                .ok()
-                .and_then(|text| markdown::relink(&text, old, new))
-                .filter(|text| vault::write(&note.path, text).is_ok());
-            if let Some(text) = rewritten {
-                (note.tags, note.links) = Note::index(&text);
-                changed.push(note.path.clone());
-                self.graph_stale = true;
-            }
+        let done = self.relink_notes(old, new);
+        let changed = done.rewritten;
+        // A note that could not be rewritten keeps its old links: say which, the others went on.
+        for (path, e) in done.failed {
+            self.fail(tr("Links not updated in", "Liens non mis à jour dans"), &path, e, cx);
         }
-        self.refresh_graph(cx);
+        if changed.is_empty() {
+            return false;
+        }
+        // The links moved, the names did not.
+        self.graph_changed(cx);
         // The other pane's note is reloaded here; the active pane's is up to the caller
         // (it may be leaving it).
         let showing = |pane: &Pane| pane.path.as_ref().is_some_and(|path| changed.contains(path));
@@ -301,25 +293,8 @@ impl Shell {
     // ponytail: synchronous rewrite, limited to the notes the index says link to this one, like `relink`;
     // typing a heading rewrites them at each save, which is as often as the note is written.
     fn follow_heading(&mut self, path: &Path, before: &str, after: &str, cx: &mut Context<Self>) {
-        let (old, new): (Vec<_>, Vec<_>) = (markdown::headings(before), markdown::headings(after));
-        let changed: Vec<_> = old.iter().zip(&new).filter(|(a, b)| a.0 != b.0 || a.1 != b.1).collect();
-        let [(was, now)] = changed.as_slice() else { return };
-        if old.len() != new.len() || was.0 != now.0 || now.1.trim().is_empty() || was.1.trim().is_empty() {
-            return;
-        }
-        let (name, key) = (vault::stem(path), vault::stem(path).to_lowercase());
-        let mut rewritten = Vec::new();
-        for note in self.notes.iter_mut().filter(|n| n.path != path && n.links.contains(&key)) {
-            let fresh = fs::read_to_string(&note.path)
-                .ok()
-                .map(|text| embed::rename_heading(&text, &name, was.1.trim(), now.1.trim()))
-                .filter(|(_, count)| *count > 0)
-                .filter(|(text, _)| vault::write(&note.path, text).is_ok());
-            if let Some((text, _)) = fresh {
-                (note.tags, note.links) = Note::index(&text);
-                rewritten.push(note.path.clone());
-            }
-        }
+        let Some((was, now)) = embed::renamed_heading(before, after) else { return };
+        let rewritten = self.follow_heading_notes(path, &was, &now);
         for pane in 0..self.panes.len() {
             if pane != self.active && self.panes[pane].path.as_ref().is_some_and(|p| rewritten.contains(p)) {
                 self.in_pane(pane, |this| this.reload(cx));
@@ -334,15 +309,18 @@ impl Shell {
     /// Reloads the shown note from disk, rewritten outside the editor.
     pub(super) fn reload(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.pane().path.clone() {
-            // Reloading is not opening: a preview stays a preview, the list page stays shown.
+            // Reloading is not opening: a preview stays a preview, the list or health page stays shown.
             // Nor does it move the reader: an agent writing at the end leaves cursor and scroll
             // where they were.
-            let (preview, listing) = (self.pane_mut().preview, self.pane_mut().listing.take());
+            let (preview, page) = (self.pane_mut().preview, self.pane_mut().take_page());
             let (at, scroll) = self.pane().editor.read(cx).view();
             if self.load_note(&path, cx) {
                 self.pane().editor.update(cx, |e, cx| e.set_view(at, scroll, cx));
             }
-            (self.pane_mut().preview, self.pane_mut().listing) = (preview, listing);
+            self.pane_mut().preview = preview;
+            if let Some(page) = page {
+                self.pane_mut().set_cover(page);
+            }
         }
     }
 
@@ -418,32 +396,12 @@ impl Shell {
                 self.pane_mut().dirty = false;
                 self.pane_mut().base = content.clone();
                 self.calm();
-                let (tags, links) = markdown::index(&content);
-                // A template has neither tags nor links.
-                let (tags, links) = if vault::in_templates(&root, &path) { (Vec::new(), Vec::new()) } else { (tags, links) };
                 let old = self.pane().path.clone();
-                // The graph only changes if the note is new, renamed or linked differently.
-                let known = self.notes.iter().find(|n| Some(&n.path) == old.as_ref());
-                if known.is_none_or(|n| n.path != path || n.links[..] != links[..]) {
-                    self.graph_stale = true;
-                }
-                // The text as it was last saved, to see which heading was renamed.
-                let before = self.notes.iter().find(|n| Some(&n.path) == old.as_ref()).map(|n| n.body.clone());
-                self.notes.retain(|n| Some(&n.path) != old.as_ref() && n.path != path);
-                let body: Arc<str> = Arc::from(content);
-                self.notes.insert(
-                    0,
-                    Note {
-                        name: vault::stem(&path),
-                        tags: tags.into(),
-                        links: links.into(),
-                        aliases: markdown::aliases(&body).into(),
-                        mtime: SystemTime::now(),
-                        path: path.clone(),
-                        lower: logic::note::lowered(&body),
-                        body,
-                    },
-                );
+                let fresh = Note::from_text(vault::stem(&path), path.clone(), SystemTime::now(), Arc::from(content), vault::in_templates(&root, &path));
+                // The text as it was last saved, to see which heading was renamed. Only a rename
+                // pushes the names, and only a new link or alias refreshes the graph: a save per
+                // keystroke pause must stay cheap, so this does not go through `index_changed`.
+                let before = self.put_note(old.as_ref(), fresh);
                 if old.as_ref() != Some(&path) {
                     // Renamed by its title, the note keeps its icon.
                     if let Some(icon) = old.as_ref().and_then(|old| self.icons.remove(old)) {
@@ -493,15 +451,14 @@ impl Shell {
                     // The board key was just written into the text: stay there, the
                     // corner button shows the board when wanted.
                     let board = kanban::is_board(this.pane().editor.read(cx).text());
-                    this.pane_mut().board.text |= board && !this.pane_mut().board.was;
-                    this.pane_mut().board.was = board;
+                    this.pane_mut().board.typed(board);
                     this.keep_preview();
                     this.pane_mut().dirty = true;
                 });
                 self.save_gen += 1;
                 let generation = self.save_gen;
                 cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_millis(400)).await;
+                    cx.background_executor().timer(SAVE_DELAY).await;
                     this.update(cx, |this, cx| {
                         if this.save_gen == generation {
                             this.flush(cx);
@@ -530,6 +487,7 @@ impl Shell {
             }
             // The diagram, formula or picture takes the note's place; Escape returns to it.
             EditorEvent::View(source) => self.show_figure(source.clone(), window, cx),
+            EditorEvent::Failed(message) => self.say(Tone::Failed, message.clone(), cx),
         }
     }
 
@@ -603,7 +561,7 @@ impl Shell {
             Some(path) => self.open(&path, window, cx),
             None => {
                 self.fresh_tab(window, cx);
-                self.new_note(format!("# {name}\n\n"), cx);
+                self.new_note(vault::new_note_text(name), cx);
                 window.focus(&self.pane().editor.focus_handle(cx));
             }
         }

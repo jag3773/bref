@@ -1,21 +1,20 @@
 //! Line-by-line Markdown analysis: pure functions, no dependency on the UI.
 
 
-mod dates;
 mod front;
 mod lists;
-mod search;
 mod tables;
+mod walk;
+mod wiki;
 
-pub use dates::*;
 pub use front::*;
 pub use lists::*;
-pub use search::*;
 pub use tables::*;
+pub use walk::{Line, lines as walk};
+pub use wiki::{WikiLink, rewrite as rewrite_wikilinks};
 
 use std::ops::Range;
 
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -69,6 +68,11 @@ fn indent_len(line: &str) -> usize {
 
 pub fn is_fence(line: &str) -> bool {
     line.trim_start().starts_with("```")
+}
+
+/// The line opens (or closes) a Mermaid block: a fence whose first word is `mermaid`, in any case.
+pub fn is_mermaid_fence(line: &str) -> bool {
+    is_fence(line) && line.trim_start().trim_start_matches('`').split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("mermaid"))
 }
 
 /// The line is a table line: `classify(line, false)` calls it `Kind::Table`, without the rest of the work.
@@ -171,7 +175,7 @@ pub fn links(line: &str) -> Vec<(Range<usize>, Link)> {
         if rest.starts_with("[[")
             && let Some(e) = rest.find("]]")
         {
-            let target = rest[2..e].split(['|', '#']).next().unwrap_or("").trim();
+            let target = WikiLink::parse(&rest[2..e]).target();
             if !target.is_empty() {
                 out.push((i..i + e + 2, Link::Wiki(target.to_string())));
             }
@@ -699,27 +703,22 @@ pub fn index(text: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     let mut wikis = Vec::new();
-    let mut in_code = false;
-    for line in text[front_matter(text)..].lines() {
-        if is_fence(line) {
-            in_code = !in_code;
-        } else if !in_code {
-            for (_, link) in links(line) {
-                let (list, item) = match link {
-                    Link::Tag(t) => (&mut tags, t),
-                    Link::Wiki(w) => (&mut wikis, w.to_lowercase()),
-                    Link::Url(_) => continue,
-                };
-                if !list.contains(&item) {
-                    list.push(item);
-                }
+    for line in walk(&text[front_matter(text)..]).filter(Line::outside).map(|l| l.text) {
+        for (_, link) in links(line) {
+            let (list, item) = match link {
+                Link::Tag(t) => (&mut tags, t),
+                Link::Wiki(w) => (&mut wikis, w.to_lowercase()),
+                Link::Url(_) => continue,
+            };
+            if !list.contains(&item) {
+                list.push(item);
             }
-                        // A displayed image counts as a link to its file.
-            if let Some((_, path)) = image(line) {
-                let name = file_name(&path).to_lowercase();
-                if !wikis.contains(&name) {
-                    wikis.push(name);
-                }
+        }
+        // A displayed image counts as a link to its file.
+        if let Some((_, path)) = image(line) {
+            let name = file_name(&path).to_lowercase();
+            if !wikis.contains(&name) {
+                wikis.push(name);
             }
         }
     }
@@ -727,44 +726,21 @@ pub fn index(text: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// The text where wikilinks to `old` target `new` (alias and anchor kept,
-/// code blocks and front matter left as is); `None` if no link changes.
+/// code blocks, inline code and front matter left as is); `None` if no link changes.
 pub fn relink(text: &str, old: &str, new: &str) -> Option<String> {
     let old = old.to_lowercase();
     let meta = front_matter(text);
-    let mut out = String::with_capacity(text.len());
-    out.push_str(&text[..meta]);
-    let mut in_code = false;
-    for line in text[meta..].split_inclusive('\n') {
-        let mut done = 0;
-        if is_fence(line) {
-            in_code = !in_code;
-        } else if !in_code {
-            for (range, link) in links(line) {
-                if matches!(link, Link::Wiki(target) if target.to_lowercase() == old) {
-                                        // `[[target|alias]]` or `[[target#anchor]]`: only the target changes.
-                    let inner = &line[range.start + 2..range.end - 2];
-                    let rest = inner.find(['|', '#']).map_or("", |i| &inner[i..]);
-                    out.push_str(&line[done..range.start + 2]);
-                    out.push_str(new);
-                    out.push_str(rest);
-                    done = range.end - 2;
-                }
-            }
-        }
-        out.push_str(&line[done..]);
-    }
-    let out = format!("{}{}", &out[..meta], reembed(&out[meta..], &old, new));
+    let (body, _) = rewrite_wikilinks(&text[meta..], |w| (w.target().to_lowercase() == old).then(|| w.with(new, w.anchor)));
+    let out = format!("{}{}", &text[..meta], reembed(&body, &old, new));
     (out != text).then_some(out)
 }
 
 /// The text where `![…](folder/old)` images name the file `new`.
 fn reembed(text: &str, old: &str, new: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut in_code = false;
-    for line in text.split_inclusive('\n') {
-        if is_fence(line) {
-            in_code = !in_code;
-        } else if !in_code
+    for l in walk(text) {
+        let line = &text[l.at..l.end];
+        if l.outside()
             && let Some((range, path)) = image(line)
             && !line[range.clone()].starts_with("![[")
             && file_name(&path).to_lowercase() == old
@@ -805,19 +781,12 @@ pub fn callout(line: &str) -> Option<Range<usize>> {
 /// closing fence opens no block.
 pub fn headings(text: &str) -> Vec<(u8, &str, usize)> {
     let meta = front_matter(text);
-    let fences = text[meta..].lines().filter(|line| is_fence(line)).count();
-    let (mut seen, mut in_code, mut at, mut found) = (0, false, meta, Vec::new());
-    for line in text[meta..].split('\n') {
-        if is_fence(line) {
-            seen += 1;
-            in_code = !in_code && seen < fences;
-        } else if !in_code
-            && let (Kind::Heading(_), marker) = classify(line, false)
-        {
-            let level = line.trim_start().bytes().take_while(|&b| b == b'#').count() as u8;
-            found.push((level, line[marker..].trim(), at));
+    let mut found = Vec::new();
+    for l in walk(&text[meta..]).filter(Line::outside) {
+        if let (Kind::Heading(_), marker) = classify(l.text, false) {
+            let level = l.text.trim_start().bytes().take_while(|&b| b == b'#').count() as u8;
+            found.push((level, l.text[marker..].trim(), meta + l.at));
         }
-        at += line.len() + 1;
     }
     found
 }
@@ -846,6 +815,11 @@ pub fn comments(line: &str) -> Vec<(Range<usize>, Range<usize>, Range<usize>)> {
     found
 }
 
+/// The comment `said` on `passage`, as `comments` reads it back: `{==passage==}{>>said<<}`.
+pub fn comment_on(passage: &str, said: &str) -> String {
+    format!("{{=={passage}==}}{{>>{said}<<}}")
+}
+
 /// A comment of the note, as its panel lists it.
 #[derive(Debug, PartialEq)]
 pub struct Note<'a> {
@@ -858,8 +832,8 @@ pub struct Note<'a> {
     pub inside: usize,
     /// The byte where the whole ends.
     pub end: usize,
-    /// What it is on, in a table: `Cell C2`, `Header B`, `Row Léa`, `Column Âge`, `Table`; empty elsewhere.
-    pub scope: String,
+    /// What it is on, in a table; `None` elsewhere.
+    pub scope: Option<Scope>,
 }
 
 /// Name of column `c` as a spreadsheet writes it: `A`, `B`… `Z`, `AA`.
@@ -872,63 +846,32 @@ pub fn column_letters(c: usize) -> String {
     name
 }
 
-/// A comment line under a table starts with what it is about (see `scopes`): its name as the
-/// panel says it, and what follows.
-pub fn split_scope(said: &str) -> Option<(String, &str)> {
-    if let Some(rest) = said.strip_prefix("Table: ") {
-        return Some(("Table".into(), rest));
-    }
-    let (kind, tail) = said.strip_prefix("Row ").map(|t| ("Row", t)).or_else(|| said.strip_prefix("Column ").map(|t| ("Column", t)))?;
-    let digits = |t: &str| t.bytes().take_while(u8::is_ascii_digit).count();
-    let Some(quoted) = tail.strip_prefix('"') else {
-        let n = digits(tail);
-        return tail[n..].strip_prefix(": ").filter(|_| n > 0).map(|rest| (format!("{kind} {}", &tail[..n]), rest));
-    };
-    let plain = quoted.find("\": ").map(|i| (i, quoted[i + 3..].len(), String::new()));
-    let numbered = quoted.match_indices("\" (").find_map(|(i, _)| {
-        let n = digits(&quoted[i + 3..]);
-        let rest = quoted[i + 3 + n..].strip_prefix("): ")?;
-        (n > 0).then(|| (i, rest.len(), format!(" ({})", &quoted[i + 3..i + 3 + n])))
-    });
-    let (i, left, number) = [plain, numbered].into_iter().flatten().min_by_key(|(i, ..)| *i)?;
-    Some((format!("{kind} {}{number}", &quoted[..i]), &quoted[quoted.len() - left..]))
-}
-
 /// All the note's comments, outside code blocks.
 pub fn all_comments(text: &str) -> Vec<Note<'_>> {
         // Almost no note has any: a single search says so, without reading the lines.
     if !text.contains("{==") && !text.contains("{>>") {
         return Vec::new();
     }
-    let fences = text.lines().filter(|line| is_fence(line)).count();
-    let (mut seen, mut in_code, mut at, mut found) = (0, false, 0, Vec::new());
-    // Line of the table we are in (the header is 0, the dashes 1).
-    let mut row: Option<usize> = None;
-    for line in text.split('\n') {
-        if is_fence(line) {
-            seen += 1;
-            in_code = !in_code && seen < fences;
+    let (mut found, mut row) = (Vec::new(), None::<usize>);
+    // `row`: line of the table we are in (the header is 0, the dashes 1).
+    for Line { at, text: line, fence, code, .. } in walk(text) {
+        if fence {
             row = None;
-        } else if !in_code {
+        } else if !code {
             row = line.trim_start().starts_with('|').then(|| row.map_or(0, |r| r + 1));
             let cells = row.map(|_| cells(line));
             for (whole, noted, said) in comments(line) {
-                let mut note = Note { noted: &line[noted.clone()], said: &line[said.clone()], at: at + whole.start, inside: at + said.start, end: at + whole.end, scope: String::new() };
+                let mut note = Note { noted: &line[noted.clone()], said: &line[said.clone()], at: at + whole.start, inside: at + said.start, end: at + whole.end, scope: None };
                 if let Some(cells) = &cells {
                     let c = cells.iter().rposition(|cell| cell.start <= whole.start).unwrap_or(0);
-                    note.scope = match row {
-                        Some(0) => format!("Header {}", column_letters(c)),
-                        Some(r) => format!("Cell {}{}", column_letters(c), r.saturating_sub(1)),
-                        None => String::new(),
-                    };
-                } else if noted.start == whole.start && let Some((scope, rest)) = split_scope(note.said) {
-                    note.scope = scope;
+                    note.scope = row.map(|r| if r == 0 { Scope::Header(c) } else { Scope::Cell(c, r.saturating_sub(1)) });
+                } else if noted.start == whole.start && let Some((scope, rest)) = Scope::parse(note.said) {
+                    note.scope = Some(scope);
                     note.said = rest;
                 }
                 found.push(note);
             }
         }
-        at += line.len() + 1;
     }
     found
 }
@@ -979,115 +922,23 @@ mod tests {
     }
 
     #[test]
-    fn finds_links() {
-        let l = links("voir [[Ma note|alias]] et #projet/x sur https://a.b/c).");
-        assert_eq!(l[0].1, Link::Wiki("Ma note".into()));
-        assert_eq!(l[1].1, Link::Tag("projet/x".into()));
-        assert_eq!(l[2].1, Link::Url("https://a.b/c".into()));
-        assert!(links("a#b et #123").is_empty());
-                // List page: front matter keys make the columns, in order of appearance.
-        let (dune, emma) = ("---\nauteur: Herbert\nnote: 9\ntags: [sf, désert]\n---\n# Dune", "---\nnote: 10\nlu: oui\n---\n");
-        assert_eq!(front_keys(dune), ["auteur", "note", "tags"]);
-        let (keys, rows) = list_table(&[dune, emma, "# Sans en-tête"]);
-        assert_eq!(keys, ["auteur", "note", "tags", "lu"]);
-        assert_eq!(rows, [vec!["Herbert", "9", "sf, désert", ""], vec!["", "10", "", "oui"], vec![""; 4]]);
-        use std::cmp::Ordering::{Greater, Less};
-        assert_eq!((cell_order("9", "10"), cell_order("b", "A"), cell_order("", "z"), cell_order("1,5", "1.25")), (Less, Greater, Greater, Greater));
-                // Replacements: the text as is, or a regular expression and its groups.
-        let put = |query: &str, with: &str, word, regex| replacements("Le chat, le chien.\nle rat", query, with, false, word, regex);
-        assert_eq!(put("le", "un", true, false), [(0..2, "un".to_string()), (9..11, "un".into()), (19..21, "un".into())]);
-        assert_eq!(put(r"le (\w+)", "$1 (le)", false, true), [(0..7, "chat (le)".to_string()), (9..17, "chien (le)".into()), (19..25, "rat (le)".into())]);
-        assert_eq!(put("^le", "x", false, true).len(), 2);
-        assert_eq!(put("ch|ra", "", true, true), []);
-        assert!(put("(", "", false, true).is_empty() && put("x*", "", false, true).is_empty());
-        assert_eq!(replacements("A a", "a", "b", true, false, true), [(2..3, "b".to_string())]);
-        // A regular expression that does not compile is said; text is never one, nor an empty search.
-        assert!(broken("(", false, true) && broken("[a", true, true) && !broken("a*", false, true) && !broken("(", false, false) && !broken("", false, true));
-        // Replacing with what contains the search does not loop; `$1` without a group is empty.
-        assert_eq!(put("le", "lele", true, false).len(), 3);
-        assert_eq!(put("le", "${1}x", true, true)[0].1, "x");
-        let all = Swap { query: "le".into(), with: "un".into(), case: false, word: true, regex: false };
-        assert_eq!(swap_except("Le chat, le chien.", &all, &[]), Some(("un chat, un chien.".into(), 2)));
-        assert_eq!(swap_except("rien", &all, &[]), None);
-                // Comment names: by content, numbered when the first cells are alike, by position when empty.
-        let grid = |rows: &[&[&str]]| rows.iter().map(|r| r.iter().map(|c| c.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>();
-        let rows = grid(&[&["Nom", "", "Âge"], &["---", "---", "---"], &["Léa", "", "1"], &["Léa", "", "2"], &["", "", ""]]);
-        let (names, cols) = scopes(&rows);
-        assert_eq!(names, ["Row \"Nom\"", "Row \"Léa\" (1)", "Row \"Léa\" (2)", "Row 4"]);
-        assert_eq!(cols, ["Column \"Nom\"", "Column 2", "Column \"Âge\""]);
-                // A line follows its row when it is renamed or moved up, goes with it when it is deleted, and the others stay.
-        let old = (names.clone(), cols.clone());
-        let after = grid(&[&["Nom", "", "Âge"], &["---", "---", "---"], &["Léa", "", "2"], &["", "", ""]]);
-        let new = scopes(&after);
-        let lines = ["{>>Row \"Léa\" (1): a<<}", "{>>Row \"Léa\" (2): b<<}", "{>>Column 2: c<<}", "{>>Table: d<<}", "{>>libre<<}", "  {>>Row 4: e<<}"];
-        let moved = [Some(0), None, Some(1), Some(2)];
-        let kept = [Some(0), Some(1), Some(2)];
-        assert_eq!(
-            retarget(&lines, &old, &new, (&moved, &kept), false),
-            [None, Some("{>>Row \"Léa\": b<<}".to_string()), Some(lines[2].to_string()), Some(lines[3].to_string()), Some(lines[4].to_string()), Some("  {>>Row 3: e<<}".to_string())]
-        );
-        assert_eq!(retarget(&lines, &old, &new, (&[None; 4], &[None; 3]), true), [None, None, None, None, Some(lines[4].to_string()), None]);
-                // Comments: the text, the comment, and where the whole starts; not in code.
-        let line = "un {==mot **fort**==}{>>à revoir<<} et {==deux==}{>><<} {==seul==}";
-        assert_eq!(comments(line), [(3..36, 6..18, 24..33), (40..56, 43..47, 53..53)]);
-        let note = format!("# T\n{line}\n```\n{line}\n```");
-        let found: Vec<_> = all_comments(&note).into_iter().map(|n| (n.noted, n.said, n.at, n.inside)).collect();
-        assert_eq!(found, [("mot **fort**", "à revoir", 7, 28), ("deux", "", 44, 57)]);
-                // A comment on its own has nothing commented, and a full one is not counted twice.
-        assert_eq!(comments("a {>>seul<<} b {==x==}{>>y<<}"), [(2..12, 2..2, 5..9), (15..29, 18..19, 25..26)]);
-        assert_eq!(comments("{>>pas fini"), []);
-                // Where a comment is: in a cell, a header, or a line under a table named by what it is about.
-        let table = "| a | b |\n| - | - |\n| {==x==}{>>1<<} | y |\n| u | {==v==}{>>2<<} |\n\n{>>Row \"x\" (2): trois<<}\n\n{>>Column 2: quatre<<}\n\n{>>Table: cinq<<}\n\n{>>libre<<}";
-        let scopes: Vec<_> = all_comments(table).into_iter().map(|n| (n.scope, n.said)).collect();
-        assert_eq!(scopes, [("Cell A1".into(), "1"), ("Cell B2".into(), "2"), ("Row x (2)".into(), "trois"), ("Column 2".into(), "quatre"), ("Table".into(), "cinq"), (String::new(), "libre")]);
-        assert_eq!(split_scope("Row \"a\": b\": c"), Some(("Row a".into(), "b\": c")));
-        assert_eq!(split_scope("Column \"\": x"), Some(("Column ".into(), "x")));
-        assert_eq!((split_scope("Row x: y"), split_scope("Rowing: y"), split_scope("Table:x")), (None, None, None));
-        assert_eq!((column_letters(0), column_letters(25), column_letters(26), column_letters(701), column_letters(702)), ("A".into(), "Z".into(), "AA".into(), "ZZ".into(), "AAA".into()));
-        let mut flags = vec![0u16; line.len()];
-        inline(line, 0, &mut flags);
-        assert!(flags[3..6].iter().all(|f| *f == DIM) && flags[6] == 0 && flags[12] == BOLD);
-        assert!(flags[18..24].iter().all(|f| *f == DIM) && flags[24..33].iter().all(|f| *f == DIM | ITALIC | QUIET) && flags[36] == 0);
-                // Dates after `@`. October 9, 2026 is a Friday.
-        let today = (2026, 10, 9);
-        assert_eq!((day_number((1970, 1, 1)), day_number((2000, 3, 1)), day_of(day_number((2024, 2, 29)))), (0, 11_017, (2024, 2, 29)));
-        assert_eq!(day_of(day_number((2026, 12, 31)) + 1), (2027, 1, 1));
-                // October 2026 starts on a Thursday and has 31 days; February 2024 has 29.
-        assert_eq!((month(2026, 10, true), month(2026, 10, false), month(2024, 2, true)), ((3, 31), (4, 31), (3, 29)));
-        assert_eq!((add_months((2026, 1, 31), 1), add_months((2026, 12, 5), 1), add_months((2026, 1, 5), -1)), ((2026, 2, 28), (2027, 1, 5), (2025, 12, 5)));
-        let found = |q: &str| dates(q, today).into_iter().map(|(_, fr, date)| (fr, date)).collect::<Vec<_>>();
-        assert_eq!(found("").len(), 10);
-        assert_eq!(found("dem"), [("demain", (2026, 10, 10))]);
-        assert_eq!(found("Aujourd’"), [("aujourd'hui", today)]);
-        assert_eq!(found("yes"), [("hier", (2026, 10, 8))]);
-        assert_eq!(found("vendredi"), [("vendredi", (2026, 10, 16))]);
-        assert_eq!(found("mon"), [("lundi", (2026, 10, 12))]);
-        assert_eq!(found("t").len(), 4);
-        assert_eq!(found("2026-11-02"), [("", (2026, 11, 2))]);
-        assert!(found("2026-02-30").is_empty() && found("2026-1-2").is_empty() && found("zz").is_empty());
-                // `[text](address)`: a single link, over its whole range; neither an image nor a path.
-        let l = links("lire [la doc](https://a.b/c#d) et ![img](https://a.b/i.png)");
-        assert_eq!(l[0], (5..30, Link::Url("https://a.b/c#d".into())));
-        assert_eq!(l[1], (41..58, Link::Url("https://a.b/i.png".into())));
-        assert_eq!(l.len(), 2);
-        assert!(links("[x](fichier.md) [y]( ) [a [b](c)").is_empty());
-        assert_eq!(web_link("[la doc](mailto:a@b.c) suite"), Some((1..7, 9..21)));
-        assert!(is_url("https://a.b") && !is_url("https://") && !is_url("https://a b") && !is_url("a.b"));
-        let mut flags = vec![0u16; 31];
-        inline("lire [la doc](https://a.b/c#d).", 0, &mut flags);
-        assert!(flags[5] == DIM && flags[6..12].iter().all(|f| *f == LINK) && flags[12..14] == [DIM; 2]
-            && flags[14..29].iter().all(|f| *f == DIM | QUIET) && flags[29] == DIM && flags[30] == 0);
-        let (tags, wikis) = index("#A\n```\n#b [[z]]\n```\n#a #c [[X]] [[x|alias]] [[Y]]");
-        assert_eq!(tags, vec!["a", "c"]);
-        assert_eq!(wikis, vec!["x", "y"]);
+    fn spots_mermaid_fences() {
+        for yes in ["```mermaid", "```Mermaid", "  ```MERMAID", "``` mermaid", "```mermaid title"] {
+            assert!(is_mermaid_fence(yes), "{yes:?}");
+        }
+        for no in ["```", "```rust", "```mermaids", "mermaid", "`mermaid`", ""] {
+            assert!(!is_mermaid_fence(no), "{no:?}");
+        }
     }
 
     #[test]
     fn relinks_renamed_notes() {
-        let text = "[[Test]] et [[test|alias]], [[ Test#titre]]\n```\n[[Test]]\n```\n[[Testé]] [[Test]]";
-        let want = "[[Essai]] et [[Essai|alias]], [[Essai#titre]]\n```\n[[Test]]\n```\n[[Testé]] [[Essai]]";
+        let text = "[[Test]] et [[test|alias]], [[ Test#titre]] `[[Test]]`\n```\n[[Test]]\n```\n[[Testé]] [[Test]]";
+        let want = "[[Essai]] et [[Essai|alias]], [[ Essai#titre]] `[[Test]]`\n```\n[[Test]]\n```\n[[Testé]] [[Essai]]";
         assert_eq!(relink(text, "Test", "Essai").as_deref(), Some(want));
         assert_eq!(relink(text, "Autre", "Essai"), None);
+                // A stray fence opens no block: the links after it are renamed, as headings and embeds see them.
+        assert_eq!(relink("```\n[[Test]]", "Test", "Essai").as_deref(), Some("```\n[[Essai]]"));
                 // A renamed image: both spellings follow, the rest of the line too.
         let text = "![a](img/Le%20chat.png \"t\") ![[le chat.png|300]] le chat.png";
         let want = "![a](img/Un%20chien.png \"t\") ![[Un chien.png|300]] le chat.png";
@@ -1334,64 +1185,6 @@ mod tests {
             [(1, "Un", 0), (3, "Trois ##", third), (2, "Deux", text.find("## Deux").unwrap()), (1, "après un bloc jamais fermé", text.rfind("# ").unwrap())]
         );
         assert!(headings("```\n# a\n```\n```\n# b\n```").is_empty());
-    }
-
-    #[test]
-    fn finds_passages() {
-        let text = "Été, été. L'ÉTÉ d'**été**\nétés";
-        assert_eq!(find(text, "été", false, false).len(), 5);
-        assert_eq!(find(text, "été", true, false).len(), 3);
-        assert_eq!(find(text, "été", false, true).len(), 4);
-        let bold = find(text, "**été**", true, true);
-        assert_eq!((bold.len(), bold[0].clone()), (1, text.find("**").unwrap()..text.find('\n').unwrap()));
-        assert_eq!(find("aaaa", "aa", true, false), [0..2, 2..4]);
-        assert!(find(text, "", false, false).is_empty() && find("", "a", false, false).is_empty());
-        // A letter that grows when lowercased ("İ": two characters) shifts nothing.
-        let found = find("İstanbul", "stan", false, false);
-        assert_eq!((found.len(), found[0].clone()), (1, "İ".len().."İstan".len()));
-    }
-
-    #[test]
-    fn counts_words_and_characters() {
-        assert_eq!(counts(""), (0, 0));
-        assert_eq!(counts("# Été\n\nl'idée, **déjà** 2 fois\n"), (5, 28));
-        assert_eq!(counts("👨‍👩‍👧 ok"), (1, 4));
-                // Recounting only the changed lines gives the counts of the whole text.
-        let texts = ["", "a", "un mot\n", "un mot\ndeux\n", "un mot\r\ndeux\r\n", "un mot\ndeux mots\n", "un\n\ndeux\n", "été\nl'idée 👨‍👩‍👧\nfin", "un mot\ndeux\ntrois\n", "x\r", "x\r\n", "\n", "\n\n", "deux\n"];
-        for old in texts {
-            for new in texts {
-                assert_eq!(recount(old, counts(old), new), counts(new), "{old:?} -> {new:?}");
-            }
-        }
-                // A long text, compared by blocks: a keystroke at the start, in the middle, at the end, and a line removed.
-        let long: String = (0..2000).map(|i| format!("ligne {i} d'été\n")).collect();
-        for at in [0, 7, long.len() / 2, long.len() - 1, long.len()] {
-            let typed = format!("{}mot {}", &long[..at], &long[at..]);
-            assert_eq!(recount(&long, counts(&long), &typed), counts(&typed), "keystroke at {at}");
-            assert_eq!(recount(&typed, counts(&typed), &long), counts(&long), "indent at {at}");
-        }
-                // Random edits (always the same): insert, delete, replace, anywhere.
-        let bits = ["a", " ", "\n", "\r\n", "\r", "é", "👨‍👩‍👧", "l'idée", "3.14", "mot mot\n", "", "\n\n"];
-        let mut seed = 42u64;
-        let mut next = |n: usize| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (seed >> 33) as usize % n.max(1)
-        };
-        let (mut text, mut known) = (String::new(), (0, 0));
-        for step in 0..3000 {
-            let cut = |t: &str, mut i: usize| {
-                while !t.is_char_boundary(i) {
-                    i -= 1;
-                }
-                i
-            };
-            let from = cut(&text, next(text.len() + 1));
-            let to = cut(&text, (from + next(6)).min(text.len())).max(from);
-            let fresh = format!("{}{}{}", &text[..from], bits[next(bits.len())], &text[to..]);
-            known = recount(&text, known, &fresh);
-            assert_eq!(known, counts(&fresh), "edit {step}: {text:?} -> {fresh:?}");
-            text = fresh;
-        }
     }
 
     #[test]

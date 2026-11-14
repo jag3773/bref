@@ -11,10 +11,16 @@ mod render;
 
 use std::ops::Range;
 
+/// Whole copies of the diagram are kept, so fewer steps than the other surfaces.
+const UNDO_DEPTH: usize = 100;
+
+/// How far the canvas zooms out and in.
+const ZOOM: zoom::Limits = zoom::Limits::new(0.2, 4.);
+
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementInputHandler, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, Pixels, Point, Rgba, ScrollWheelEvent, SharedString, StrikethroughStyle, TextRun, UTF16Selection, UnderlineStyle,
+    MouseUpEvent, PathBuilder, Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, TextRun, UTF16Selection, UnderlineStyle,
     Window, actions, canvas, div, fill, font, point, prelude::*, px, quad, rgb, size, svg,
 };
 
@@ -23,10 +29,12 @@ use crate::{
     logic::diagram::{self, Anchor, Cmd, Diagram, End, Form, Route, Slot},
     logic::library::{self, Preset},
     logic::relation::Relation,
+    logic::undo::History,
+    logic::zoom,
     logic::richtext::{self, Span},
     ui::line::{self as input, Line as Input, To},
     ui::widgets::{button, tip},
-    ui::assets::{mono, sans}, lang::tr,
+    lang::tr,
 };
 
 actions!(canvas, [ZoomIn, ZoomOut, ZoomFit, Erase, EraseNext, Duplicate, SelectAll, Undo, Redo, Confirm, Cancel, Left, Right, Up, Down, SelectUp, SelectDown, Paste, NextText]);
@@ -181,17 +189,7 @@ fn usual(tool: Tool) -> (f32, f32) {
         return library::presets().get(i).map_or((140., 60.), |p| (p.w, p.h));
     }
     let Tool::Shape(form) = tool else { return (140., 60.) };
-    match form {
-        Form::Text => (80., diagram::LINE),
-        Form::Actor => (40., 80.),
-        Form::Cylinder => (80., 100.),
-        Form::Branch => (40., 40.),
-        Form::Package => (220., 150.),
-        Form::Frame => (260., 170.),
-        Form::Lane => (160., 320.),
-        Form::Ellipse | Form::Diamond => (120., 80.),
-        _ => (140., 60.),
-    }
+    form.default_size()
 }
 
 /// The form a shape tool draws, and what is written in it to begin with.
@@ -253,8 +251,6 @@ impl Row {
 pub struct Canvas {
     focus: FocusHandle,
     theme: Theme,
-    /// The app draws the window buttons: the toolbar leaves room for them.
-    client: bool,
     diagram: Diagram,
     selected: Vec<u32>,
     tool: Tool,
@@ -291,8 +287,7 @@ pub struct Canvas {
     link_pick: Relation,
     /// The library is open, with what is typed to search it.
     library: Option<String>,
-    undo: Vec<Diagram>,
-    redo: Vec<Diagram>,
+    history: History<Diagram>,
     /// The pointer's shape, depending on what it hovers and what is dragged.
     hand: CursorStyle,
     bounds: Bounds<Pixels>,
@@ -315,7 +310,6 @@ impl Canvas {
         Self {
             focus: cx.focus_handle(),
             theme,
-            client: false,
             diagram,
             selected: Vec::new(),
             tool: Tool::Select,
@@ -337,8 +331,7 @@ impl Canvas {
             shape_pick: Form::Rect,
             link_pick: Relation::Navigable,
             library: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
+            history: History::capped(UNDO_DEPTH),
             hand: CursorStyle::Arrow,
             bounds: Bounds::default(),
             exported: false,
@@ -373,7 +366,7 @@ impl Canvas {
     /// Whether a gesture is in progress, and how many steps of undo there are.
     #[cfg(test)]
     pub fn gesture(&self) -> (bool, usize) {
-        (self.drag != Drag::None, self.undo.len())
+        (self.drag != Drag::None, self.history.len())
     }
 
     /// Where the handle on side `side` (top, right, bottom, left) of a shape is, in the window.
@@ -419,15 +412,15 @@ impl Canvas {
     }
 
     /// The theme, as the window knows it.
-    pub fn sync(&mut self, theme: Theme, client: bool) {
-        (self.theme, self.client) = (theme, client);
+    pub fn sync(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     pub fn exported(&mut self, cx: &mut Context<Self>) {
         self.exported = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+            cx.background_executor().timer(crate::ui::widgets::FLASH).await;
             this.update(cx, |this, cx| {
                 this.exported = false;
                 cx.notify();
@@ -507,30 +500,34 @@ impl Canvas {
     // ponytail: undo keeps whole copies of the diagram (100 max): a
     // diagram weighs a few KB. Switch to an operation log if they grow.
     fn remember(&mut self) {
-        self.undo.push(self.diagram.clone());
-        if self.undo.len() > 100 {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
+        self.history.record(self.diagram.clone());
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
         // The lifelines of a sequence diagram follow their messages.
-        self.diagram.fit_sequence();
-        // A pin stays on the border of the shape it is on, when that was moved or resized.
-        self.diagram.seat_pins();
+        self.diagram.normalise();
         cx.emit(CanvasEvent::Changed);
         cx.notify();
     }
 
-    fn restore(&mut self, redo: bool, cx: &mut Context<Self>) {
-        let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
-        if let Some(diagram) = from.pop() {
-            to.push(std::mem::replace(&mut self.diagram, diagram));
-            (self.editing, self.drag, self.slot) = (None, Drag::None, Slot::Middle);
-            self.selected.clear();
-            self.changed(cx);
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        if let Some(diagram) = self.history.undo() {
+            self.history.undone(std::mem::replace(&mut self.diagram, diagram));
+            self.restored(cx);
         }
+    }
+
+    fn redo(&mut self, cx: &mut Context<Self>) {
+        if let Some(diagram) = self.history.redo() {
+            self.history.redone(std::mem::replace(&mut self.diagram, diagram));
+            self.restored(cx);
+        }
+    }
+
+    fn restored(&mut self, cx: &mut Context<Self>) {
+        (self.editing, self.drag, self.slot) = (None, Drag::None, Slot::Middle);
+        self.selected.clear();
+        self.changed(cx);
     }
 
     /// The key that opens the menu of relationships, and the one that picks the n-ary association in it.
@@ -653,9 +650,8 @@ impl EntityInputHandler for Canvas {
 /// Theme text colour as `0xrrggbb`, for the neutral stroke of a diagram
 /// drawn outside the canvas.
 pub fn neutral(theme: Theme) -> u32 {
-    let c = Rgba::from(theme.text);
-    let byte = |v: f32| (v * 255.) as u32;
-    byte(c.r) << 16 | byte(c.g) << 8 | byte(c.b)
+    let [r, g, b] = crate::ui::theme::rgb8(theme.text);
+    (r as u32) << 16 | (g as u32) << 8 | b as u32
 }
 
 

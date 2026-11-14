@@ -1,5 +1,6 @@
 //! Motion: short fades when the panel, the format bar or a folder opens; `motion=off` makes them instant.
 
+use crate::platform::config;
 use super::*;
 
 #[gpui::test]
@@ -45,7 +46,7 @@ fn fades_never_move_or_delay_anything(cx: &mut TestAppContext) {
     };
     choose(cx, "down enter");
     assert!(shell.read_with(cx, |s, _| s.prefs.motion == "off" && !s.theme.motion));
-    assert!(vault::load_settings().contains("motion=off\n"));
+    assert!(config::load(config::File::Settings).contains("motion=off\n"));
     assert_eq!(panel(cx), on);
     // Escape takes the previewed choice back; the first choice turns them on again.
     choose(cx, "up escape");
@@ -62,10 +63,14 @@ fn fades_never_move_or_delay_anything(cx: &mut TestAppContext) {
     assert_eq!((fading(cx, &dir), fading(cx, &other)), (None, None));
     shell.update(cx, |s, _| s.nav.unfold(dir.clone()));
     assert_eq!(fading(cx, &dir.join("Dedans.md")), Some(1));
-    std::thread::sleep(crate::ui::widgets::FADE + std::time::Duration::from_millis(20));
+    // `Nav` times the fade on the real clock, not GPUI's (nav.rs): wait for its end by looking, up to a deadline,
+    // rather than for a fixed time that a loaded machine could overrun.
+    let deadline = std::time::Instant::now() + 50 * crate::ui::widgets::FADE;
+    while fading(cx, &dir.join("Dedans.md")).is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert_eq!(fading(cx, &dir.join("Dedans.md")), None);
     cx.run_until_parked();
-    fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

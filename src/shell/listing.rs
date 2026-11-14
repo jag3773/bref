@@ -9,7 +9,6 @@ use gpui::{
 };
 use crate::{
     views::field::{Field, FieldEvent},
-    ui::line::Line,
     logic::markdown::{self},
     lang::tr,
     platform::vault,
@@ -33,23 +32,21 @@ impl Shell {
         // Escape clears the filter.
         cx.subscribe(&filter, |_, filter, event: &FieldEvent, cx| {
             if let FieldEvent::Cancel = event {
-                filter.update(cx, |filter, cx| {
-                    filter.line = Line::default();
-                    cx.notify();
-                });
+                filter.update(cx, |filter, cx| filter.clear(cx));
             }
         })
         .detach();
         window.focus(&filter.focus_handle(cx));
         self.pane_mut().peek = false;
-        self.pane_mut().listing = Some(Listing { of, by: 0, back: false, filter, edit: None, scroll: gpui::ScrollHandle::new() });
+        self.pane_mut().set_cover(Cover::Listing(Listing::new(of, filter)));
         cx.notify();
     }
 
     /// List page: the columns ("Note", then the front-matter keys) and, sorted, the notes of the
     /// folder or tag that the filter keeps, with their cells.
     pub(super) fn listed(&self, cx: &App) -> Option<(Vec<String>, Vec<ListedNote>)> {
-        let Listing { of, by, back, filter, .. } = self.pane().listing.as_ref()?;
+        let listing = self.pane().listing()?;
+        let (of, by, back, filter) = (listing.of(), listing.by(), listing.reversed(), listing.filter());
         let tag = tag_of(of);
         let inside: Vec<&Note> = self.notes.iter().filter(|note| tag.map_or_else(|| note.path.starts_with(of), |tag| note.tags.iter().any(|t| t == tag))).collect();
         let bodies: Vec<&str> = inside.iter().map(|note| &*note.body).collect();
@@ -59,11 +56,11 @@ impl Shell {
             cells.insert(0, note.name.clone());
             (note.path.clone(), cells)
         };
-        let filter = &filter.read(cx).line.text;
+        let filter = filter.read(cx).text();
         let mut rows: Vec<(PathBuf, Vec<String>)> = inside.iter().zip(cells).map(named).filter(|(_, cells)| markdown::row_kept(&keys, cells, filter)).collect();
-        let by = (*by).min(keys.len() - 1);
+        let by = by.min(keys.len() - 1);
         rows.sort_by(|a, b| markdown::cell_order(&a.1[by], &b.1[by]).then_with(|| markdown::cell_order(&a.1[0], &b.1[0])));
-        if *back {
+        if back {
             rows.reverse();
         }
         Some((keys, rows))
@@ -71,8 +68,8 @@ impl Shell {
 
     /// Sorts the list page by this column; asking again reverses the order.
     pub(super) fn sort_listing(&mut self, col: usize, cx: &mut Context<Self>) {
-        if let Some(Listing { by, back, .. }) = &mut self.pane_mut().listing {
-            (*back, *by) = (*by == col && !*back, col);
+        if let Some(listing) = self.pane_mut().listing_mut() {
+            listing.sort_by(col);
         }
         cx.notify();
     }
@@ -93,31 +90,32 @@ impl Shell {
         })
         .detach();
         window.focus(&field.focus_handle(cx));
-        if let Some(listing) = &mut self.pane_mut().listing {
-            listing.edit = Some((path, key, field));
+        if let Some(listing) = self.pane_mut().listing_mut() {
+            listing.set_edit(Some((path, key, field)));
         }
         cx.notify();
     }
 
     /// Closes the open cell without writing anything; typing goes back to the filter.
     pub(super) fn list_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(listing) = &mut self.pane_mut().listing
-            && listing.edit.take().is_some()
+        if let Some(listing) = self.pane_mut().listing_mut()
+            && listing.edit().is_some()
         {
-            window.focus(&listing.filter.focus_handle(cx));
+            listing.set_edit(None);
+            window.focus(&listing.filter().focus_handle(cx));
             cx.notify();
         }
     }
 
     /// Confirms the open cell: its key is rewritten in the note's front matter, and nothing else.
     pub(super) fn list_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, key, field)) = self.pane_mut().listing.as_mut().and_then(|listing| listing.edit.clone()) else {
+        let Some((path, key, field)) = self.pane_mut().listing_mut().and_then(|listing| listing.edit().cloned()) else {
             return;
         };
         self.list_close(window, cx);
         // The open note is saved first: it is the file being rewritten.
         self.flush(cx);
-        let value = field.read(cx).line.text.clone();
+        let value = field.read(cx).text().to_string();
         let Ok(old) = fs::read_to_string(&path) else {
             return self.say(super::Tone::Failed, format!("{} {}", tr("Cannot read", "Impossible de lire"), path.display()), cx);
         };
@@ -128,13 +126,9 @@ impl Shell {
         if let Err(e) = vault::write(&path, &new) {
             return self.say(super::Tone::Failed, format!("{} {} : {}", tr("Not rewritten:", "Non réécrite :"), path.display(), crate::lang::io_reason(&e)), cx);
         }
-        if let Some(note) = self.notes.iter_mut().find(|note| note.path == path) {
-            (note.tags, note.links) = crate::logic::note::Note::index(&new);
-            note.aliases = markdown::aliases(&new).into();
-            note.set_body(new.as_str().into());
-        }
-        self.graph_stale = true;
-        self.refresh_graph(cx);
+        self.edit_note_text(&path, new.as_str().into());
+        // A front matter key was set: the names are left as they are.
+        self.graph_changed(cx);
         // The note shown under the list is reloaded: it just changed on disk.
         self.each_pane(|this| {
             if this.pane().path.as_ref() == Some(&path) {
@@ -151,10 +145,11 @@ impl Shell {
     pub(super) fn render_listing(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = self.theme;
         let (keys, rows) = self.listed(cx).unwrap_or_default();
-        let Some(Listing { of, by, back, filter, edit, scroll }) = self.pane().listing.as_ref() else {
+        let Some(listing) = self.pane().listing() else {
             return div().into_any_element();
         };
-        let (by, back, count) = (*by, *back, rows.len());
+        let (of, filter, edit, scroll) = (listing.of(), listing.filter(), listing.edit(), listing.scroll());
+        let (by, back, count) = (listing.by(), listing.reversed(), rows.len());
         // The columns share the window width, between two bounds; beyond that, the
         // page scrolls.
         let wide = |first: bool| div().flex_1().min_w(px(if first { 130. } else { 80. })).max_w(px(if first { 260. } else { 200. })).px_2();
@@ -223,7 +218,7 @@ impl Shell {
             lines.push(div().min_h(t.px(ROW)).flex().items_center().rounded(t.small()).hover(|s| s.bg(t.hover)).children(shown));
         }
         lines.push(div().flex_none().h(row * (count - to) as f32));
-        let asked = !filter.read(cx).line.text.is_empty();
+        let asked = !filter.read(cx).text().is_empty();
         let hint = div().absolute().left(t.px(6.)).top_0().text_color(t.soft).child(tr("Filter… (key:text for one column)", "Filtrer… (clé:texte pour une colonne)"));
         let filter_box = div()
             .id("list-filter")
@@ -245,7 +240,7 @@ impl Shell {
             .pt(t.px(48.))
             .px_6()
             .pb_4()
-            .text_size(t.px(13.))
+            .text_size(t.font_body())
             .flex()
             .flex_col()
             .overflow_scroll()

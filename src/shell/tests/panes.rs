@@ -291,6 +291,30 @@ fn an_outside_write_keeps_the_place(cx: &mut TestAppContext) {
     assert_eq!(at, "# Long\n\nCourt é\n".len());
 }
 
+/// A vault still being read for the first time is not read again by the watcher. On a slow disk that
+/// read outlasts the watcher's pause, and a second read beside it costs its time and its memory twice.
+/// Once the first read is in, the watcher finds what was written meanwhile.
+#[gpui::test]
+fn the_watcher_waits_for_the_first_read(cx: &mut TestAppContext) {
+    let (root, shell, cx, _config) = start(cx, "first-read");
+    let seen = |cx: &mut gpui::VisualTestContext| shell.read_with(cx, |s, _| s.notes.iter().any(|n| n.name == "Dehors"));
+    let wait = |cx: &mut gpui::VisualTestContext| {
+        for _ in 0..2 {
+            cx.executor().advance_clock(Duration::from_secs(3));
+            cx.run_until_parked();
+        }
+    };
+    assert!(!shell.read_with(cx, |s, _| s.scanning), "the first read of an opened vault ends");
+    shell.update(cx, |s, _| s.scanning = true);
+    fs::write(root.join("Dehors.md"), "# Dehors\n").unwrap();
+    wait(cx);
+    assert!(!seen(cx), "the vault was read beside its first read");
+    shell.update(cx, |s, _| s.scanning = false);
+    wait(cx);
+    assert!(seen(cx));
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A diagram rewritten outside the app (an agent through `bref mcp`) is redrawn in its open canvas, without
 /// closing it: the view stays where it was, and one step of undo goes back to what was shown.
 #[gpui::test]
@@ -349,7 +373,7 @@ fn an_outside_write_while_typing_is_merged(cx: &mut TestAppContext) {
         cx.simulate_input(typed);
     };
     let save = |cx: &mut gpui::VisualTestContext| {
-        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.executor().advance_clock(SAVED);
         cx.run_until_parked();
     };
 
@@ -363,9 +387,9 @@ fn an_outside_write_while_typing_is_merged(cx: &mut TestAppContext) {
     let cursor = shell.read_with(cx, |s, cx| s.pane().editor.read(cx).view().0);
     assert_eq!(cursor, both.find(" tapée").unwrap() + " tapée".len(), "the cursor stays where the user types");
     // Undo takes back the agent's change in one step, and only it.
-    shell.update(cx, |s, cx| s.pane().editor.update(cx, |e, cx| e.restore(false, cx)));
+    shell.update(cx, |s, cx| s.pane().editor.update(cx, |e, cx| e.undo(cx)));
     assert_eq!(text(cx), "# Plan\n\nPremière ligne tapée\nDeuxième ligne\n");
-    shell.update(cx, |s, cx| s.pane().editor.update(cx, |e, cx| e.restore(true, cx)));
+    shell.update(cx, |s, cx| s.pane().editor.update(cx, |e, cx| e.redo(cx)));
     save(cx);
     assert_eq!(fs::read_to_string(&path).unwrap(), both);
 

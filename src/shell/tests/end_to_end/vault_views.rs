@@ -1,5 +1,6 @@
 //! Tags, backlinks, front matter, trash, replace in vault, list pages, calendar, backup, search, daily note.
 
+use crate::platform::config;
 use super::*;
 
 /// Returns the note open before the vault-wide replace, where the board chapter comes back.
@@ -9,14 +10,11 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) -> PathBuf {
     // Tags: Ctrl+T lists the vault's tags; Right expands the first, Down
     // previews a note that carries it.
     fs::write(root.join("Tagué.md"), "# Tagué\n\n#alpha\n").unwrap();
-    for _ in 0..2 {
-        cx.executor().advance_clock(Duration::from_secs(3));
-        cx.run_until_parked();
-    }
+    watch(cx);
     cx.simulate_keystrokes("secondary-t down right down");
     cx.run_until_parked();
-    assert_eq!(shell.read_with(cx, |s, _| s.nav.mode), Mode::Tags);
-    assert!(vault::load_layout().starts_with("tags split"));
+    assert_eq!(shell.read_with(cx, |s, _| s.nav.mode()), Mode::Tags);
+    assert!(config::load(config::File::Layout).starts_with("tags split"));
     let (tagged, previewed) = shell.read_with(cx, |s, _| {
         let tag = s.notes.iter().flat_map(|n| n.tags.iter()).min().unwrap().clone();
         let has = |n: &&Note| n.tags.contains(&tag);
@@ -39,10 +37,10 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) -> PathBuf {
     cx.simulate_keystrokes("secondary-l");
     cx.run_until_parked();
     let rows = |cx: &mut gpui::VisualTestContext| {
-        shell.read_with(cx, |s, _| s.nav.rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>())
+        shell.read_with(cx, |s, _| s.nav.rows().iter().map(|r| r.name.clone()).collect::<Vec<_>>())
     };
     assert_eq!(rows(cx), ["Source A", "Source B"]);
-    assert!(vault::load_layout().starts_with("links split"));
+    assert!(config::load(config::File::Layout).starts_with("links split"));
     cx.simulate_keystrokes("down");
     cx.run_until_parked();
     assert!(shell.read_with(cx, |s, _| s.pane().path.as_ref().is_some_and(|p| p.to_string_lossy().contains("Source"))));
@@ -195,21 +193,21 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) -> PathBuf {
     shell.update_in(cx, |s, window, cx| s.menu_do(nav::Do::List, Some(PathBuf::from("#classique")), window, cx));
     assert_eq!(listed(cx).unwrap().1, ["Emma"]);
     shell.update(cx, |s, cx| s.open_note(&root.join("Livres/Dune.md"), cx));
-    assert!(shell.read_with(cx, |s, _| s.pane().listing.is_none()) && text(cx).ends_with("# Dune\n"));
+    assert!(shell.read_with(cx, |s, _| s.pane().listing().is_none()) && text(cx).ends_with("# Dune\n"));
     shell.update(cx, |s, cx| s.open_note(&here, cx));
     fs::remove_dir_all(root.join("Livres")).unwrap();
     j.settle(cx);
 
     // Calendar: Ctrl+Shift+J shows the month; arrows change the day, Page Down the
     // month, Enter opens that day's note, or creates it.
-    let before = shell.read_with(cx, |s, _| (s.pane().path.clone(), s.nav.mode, s.nav.panel));
+    let before = shell.read_with(cx, |s, _| (s.pane().path.clone(), s.nav.mode(), s.nav.panel()));
     cx.simulate_keystrokes("secondary-shift-j");
-    assert!(shell.read_with(cx, |s, _| s.nav.mode == Mode::Calendar && s.nav.panel != Panel::Rail));
-    shell.update(cx, |s, _| s.nav.day = (2026, 10, 30));
+    assert!(shell.read_with(cx, |s, _| s.nav.mode() == Mode::Calendar && s.nav.panel() != Panel::Rail));
+    shell.update(cx, |s, _| s.nav.set_day((2026, 10, 30)));
     cx.simulate_keystrokes("right down pagedown");
-    assert_eq!(shell.read_with(cx, |s, _| s.nav.day), (2026, 12, 7));
+    assert_eq!(shell.read_with(cx, |s, _| s.nav.day()), (2026, 12, 7));
     cx.simulate_keystrokes("pageup pageup up enter");
-    assert_eq!(shell.read_with(cx, |s, _| s.nav.day), (2026, 9, 30));
+    assert_eq!(shell.read_with(cx, |s, _| s.nav.day()), (2026, 9, 30));
     assert_eq!(text(cx), "# 2026-09-30\n\n");
     // A day of the next month, dimmed in the grid, is a cell like another: a click opens its note and
     // the grid moves to that month. Today is the one round pill; a day with a note has a dot.
@@ -217,12 +215,11 @@ pub(super) fn run(j: &Journey, cx: &mut gpui::VisualTestContext) -> PathBuf {
     let inside = cx.debug_bounds("day-2026-9-30").unwrap();
     assert!(next.origin.y == inside.origin.y && next.origin.x > inside.origin.x);
     cx.simulate_click(next.center(), gpui::Modifiers::none());
-    assert_eq!(shell.read_with(cx, |s, _| s.nav.day), (2026, 10, 1));
+    assert_eq!(shell.read_with(cx, |s, _| s.nav.day()), (2026, 10, 1));
     assert_eq!(text(cx), "# 2026-10-01\n\n");
     assert!(cx.debug_bounds("day-2026-9-30").is_some() && cx.debug_bounds("day-2026-11-1").is_some());
     shell.update(cx, |s, cx| {
-        s.nav.show_alone(before.1);
-        s.nav.panel = before.2;
+        s.show_panel(before.1, before.2, cx);
         s.open_note(before.0.as_ref().unwrap(), cx);
     });
     // Once left, the daily note is saved like any note that has a title.

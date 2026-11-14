@@ -130,6 +130,84 @@ fn names_aliases_and_a_change_on_disk() {
 }
 
 #[test]
+fn renaming_keeps_the_folder_unless_given() {
+    let root = scratch();
+    write(&root, "Sub/A.md", "# A\n");
+    write(&root, "B.md", "# B\n");
+    let mut vault = open(&root);
+    assert_eq!(ok(notes::rename_note(&mut vault, &json!({"note": "Sub/A.md", "name": "B"})))["path"], "Sub/B.md");
+    assert!(root.join("B.md").exists());
+    assert_eq!(ok(notes::rename_note(&mut vault, &json!({"note": "Sub/B.md", "name": "É 🌿"})))["path"], "Sub/É 🌿.md");
+    assert_eq!(ok(notes::rename_note(&mut vault, &json!({"note": "Sub/É 🌿.md", "folder": "Box"})))["path"], "Box/É 🌿.md");
+    assert_eq!(ok(notes::rename_note(&mut vault, &json!({"note": "Box/É 🌿.md", "name": "C", "folder": "."})))["path"], "C.md");
+    assert!(err(notes::rename_note(&mut vault, &json!({"note": "C", "name": "B"}))).contains("already"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_failed_title_rewrite_undoes_the_rename() {
+    let root = scratch();
+    write(&root, "A.md", "# A\ntext\n");
+    let mut vault = open(&root);
+    let dest = root.join("B.md");
+    crate::platform::vault::refuse_writes(&dest, true);
+    let message = err(notes::rename_note(&mut vault, &json!({"note": "A", "name": "B"})));
+    crate::platform::vault::refuse_writes(&dest, false);
+    assert!(!message.is_empty());
+    assert!(root.join("A.md").exists() && !dest.exists());
+    assert_eq!(fs::read_to_string(root.join("A.md")).unwrap(), "# A\ntext\n");
+    assert_eq!(ok(notes::rename_note(&mut vault, &json!({"note": "A", "name": "B"})))["path"], "B.md");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "# B\ntext\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn editing_a_heading_rewrites_links_to_it() {
+    let root = scratch();
+    write(&root, "A.md", "# A\n\n## Old part\ntext\n\n## Other\n");
+    write(&root, "L.md", "# L\n[[A#Old part]] ![[A#Old part]] [[A#Other]] [[A#old part|x]]\n");
+    let mut vault = open(&root);
+    ok(notes::edit_note(&mut vault, &json!({"note": "A", "edits": [{"old": "## Old part", "new": "## Né ✓ part"}]})));
+    assert_eq!(fs::read_to_string(root.join("L.md")).unwrap(), "# L\n[[A#Né ✓ part]] ![[A#Né ✓ part]] [[A#Other]] [[A#Né ✓ part|x]]\n");
+    // Two headings changed at once: ambiguous, links stay.
+    ok(notes::edit_note(&mut vault, &json!({"note": "A", "edits": [{"old": "## Other", "new": "## Z"}, {"old": "## Né ✓ part", "new": "## Y"}]})));
+    assert!(fs::read_to_string(root.join("L.md")).unwrap().contains("[[A#Other]]"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn icons_follow_a_rename() {
+    let root = scratch();
+    write(&root, "A.md", "# A\n");
+    write(&root, "Dir/X.md", "# X\n");
+    write(&root, "T.md", "# T\n");
+    write(&root, ".bref-icons", "star\tA.md\nheart\tDir\nheart\tDir/X.md\nbolt\tT.md\n");
+    let mut vault = open(&root);
+    ok(notes::rename_note(&mut vault, &json!({"note": "A", "name": "B"})));
+    ok(notes::rename_note(&mut vault, &json!({"note": "X", "folder": "Other"})));
+    // A title edit renames the file too.
+    ok(notes::edit_note(&mut vault, &json!({"note": "T", "edits": [{"old": "# T", "new": "# U"}]})));
+    let icons = fs::read_to_string(root.join(".bref-icons")).unwrap();
+    assert_eq!(icons, "bolt\tU.md\nheart\tDir\nheart\tOther/X.md\nstar\tB.md\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_table_can_be_renamed() {
+    let root = scratch();
+    write(&root, "Sub/data.csv", "a,b\n1,2\n");
+    write(&root, "N.md", "see [[data.csv]]\n");
+    let mut vault = open(&root);
+    assert_eq!(ok(notes::rename_note(&mut vault, &json!({"note": "Sub/data.csv", "name": "sales"})))["path"], "Sub/sales.csv");
+    assert!(root.join("Sub/sales.csv").exists() && !root.join("Sub/data.csv").exists());
+    assert_eq!(fs::read_to_string(root.join("N.md")).unwrap(), "see [[sales.csv]]\n");
+    write(&root, "t.TSV", "a\tb\n");
+    let mut vault = open(&root);
+    assert_eq!(ok(notes::rename_note(&mut vault, &json!({"note": "t.TSV", "name": "u"})))["path"], "u.TSV");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn editing_renames_and_comments_follow_the_app() {
     let root = scratch();
     write(&root, "Old.md", "# Old\n\nbody\n");
@@ -237,6 +315,64 @@ fn an_unreadable_folder_does_not_hide_the_rest() {
         fs::set_permissions(root.join("locked"), perms).unwrap();
     }
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn diagram_edits_reseat_pins() {
+    let root = scratch();
+    let mut vault = open(&root);
+    let made = ok(draw::create_diagram(&mut vault, &json!({"name": "Pins", "from": {
+        "shapes": [
+            {"key": "box", "form": "rect", "x": 0, "y": 0, "w": 140, "h": 60},
+            {"form": "pin", "in": "box", "x": 130, "y": 20, "w": 14, "h": 14}
+        ], "links": []
+    }})));
+    let read = || ok(draw::read_diagram(&vault, &json!({"path": made["path"]})));
+    let first = read();
+    let shapes = first["shapes"].as_array().unwrap();
+    let box_id = shapes.iter().find(|s| s["form"] == "rect").unwrap()["id"].clone();
+    let assert_seated = |diagram: &Value| {
+        let shapes = diagram["shapes"].as_array().unwrap();
+        let holder = shapes.iter().find(|s| s["form"] == "rect").unwrap();
+        let pin = shapes.iter().find(|s| s["form"] == "pin").unwrap();
+        let n = |v: &Value, key: &str| v[key].as_f64().unwrap();
+        let (cx, cy) = (n(pin, "x") + n(pin, "w") / 2., n(pin, "y") + n(pin, "h") / 2.);
+        let (x, y, w, h) = (n(holder, "x"), n(holder, "y"), n(holder, "w"), n(holder, "h"));
+        assert!((x..=x + w).contains(&cx) && (y..=y + h).contains(&cy));
+        assert!(cx == x || cx == x + w || cy == y || cy == y + h, "{diagram}");
+    };
+    assert_seated(&first);
+    for (x, y, w, h) in [(100, 50, 140, 60), (-200, -100, 140, 60), (0, 0, 20, 20), (0, 0, 900, 600), (0, 0, 140, 60)] {
+        ok(draw::edit_diagram(&mut vault, &json!({"path": made["path"], "ops": [
+            {"op": "update", "id": box_id, "x": x, "y": y, "w": w, "h": h}
+        ]})));
+        assert_seated(&ok(draw::read_diagram(&vault, &json!({"path": made["path"]}))));
+    }
+}
+
+#[test]
+fn a_labelled_create_or_destroy_stays_one() {
+    let root = scratch();
+    let mut vault = open(&root);
+    let made = ok(draw::create_diagram(&mut vault, &json!({"name": "Life", "from": {
+        "shapes": [
+            {"key": "a", "form": "lifeline", "text": "A"},
+            {"key": "b", "form": "lifeline", "text": "B"}
+        ], "links": [
+            {"from": "a", "to": "b", "relation": "create", "text": "start"},
+            {"from": "a", "to": "b", "relation": "sync", "text": "work"},
+            {"from": "a", "to": "b", "relation": "destroy", "text": "close"},
+            {"from": "a", "to": "b", "relation": "destroy"}
+        ]
+    }})));
+    let read = ok(draw::read_diagram(&vault, &json!({"path": made["path"]})));
+    let links = read["links"].as_array().unwrap();
+    let relations: Vec<_> = links.iter().map(|l| l["relation"].as_str().unwrap_or("")).collect();
+    assert_eq!(relations, ["create", "sync", "destroy", "destroy"], "{read}");
+    assert_eq!(links[0]["text"], "«create»\nstart");
+    assert_eq!(links[2]["text"], "«destroy»\nclose");
+    let y = |text: &str| read["shapes"].as_array().unwrap().iter().find(|s| s["text"] == text).unwrap()["y"].as_f64().unwrap();
+    assert!(y("B") > y("A"), "the created head is lowered to its message: {read}");
 }
 
 #[test]
@@ -455,4 +591,56 @@ fn five_thousand_notes_stay_searchable() {
     assert_eq!(listed["notes"].as_array().unwrap().len(), 100);
     assert!(listed["next"].is_string());
     let _ = fs::remove_dir_all(&root);
+}
+
+/// Templates and families are asked for by their stable key: each one is reachable, in either
+/// language, and the key does not depend on where the entry sits in the list.
+#[test]
+fn every_template_and_family_is_reachable_by_its_key() {
+    let root = scratch();
+    let mut vault = Vault::open(root.clone()).unwrap();
+    for english in [false, true] {
+        let run = |f: &dyn Fn() -> Value| if english { crate::lang::in_english(f) } else { f() };
+        let all = run(&|| ok(draw::library(&json!({}))));
+        let templates = all["templates"].as_array().unwrap();
+        assert_eq!(templates.len(), crate::logic::library::templates().len());
+        for row in templates {
+            let key = row["key"].as_str().unwrap();
+            assert_ne!(key, "diagram", "a template has no key");
+            let made = ok(draw::create_diagram(&mut vault, &json!({"name": format!("T-{key}-{english}"), "from": {"template": key}})));
+            assert!(made["path"].as_str().is_some());
+        }
+        let families: std::collections::BTreeSet<&str> = all["shapes"].as_array().unwrap().iter().map(|s| s["family"].as_str().unwrap()).collect();
+        assert!(families.len() >= 6 && !families.contains("other"));
+        for family in families {
+            let one = run(&|| ok(draw::library(&json!({"family": family}))));
+            let shapes = one["shapes"].as_array().unwrap();
+            assert!(!shapes.is_empty() && shapes.iter().all(|s| s["family"] == family));
+        }
+    }
+    assert!(err(draw::create_diagram(&mut vault, &json!({"name": "X", "from": {"template": "nope"}}))).contains("no template"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A note that cannot be rewritten is counted in `relink_errors`, the others still follow.
+#[cfg(unix)]
+#[test]
+fn a_note_that_cannot_be_relinked_is_counted() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch();
+    write(&root, "Solo.md", "# Solo\n\nbody\n");
+    write(&root, "Fine.md", "# Fine\n\n[[Solo]]\n");
+    write(&root, "ro/Stuck.md", "# Stuck\n\n[[Solo]]\n");
+    fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+    let mut vault = open(&root);
+    let moved = ok(notes::rename_note(&mut vault, &json!({"note": "Solo", "name": "Only"})));
+    fs::set_permissions(root.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(fs::read_to_string(root.join("Fine.md")).unwrap().contains("[[Only]]"));
+    // Running as root, nothing is refused: only check the count where the folder really was locked.
+    let stuck = fs::read_to_string(root.join("ro/Stuck.md")).unwrap().contains("[[Solo]]");
+    assert_eq!(moved["relink_errors"], u64::from(stuck));
+    assert_eq!(moved["rewritten"], if stuck { 1 } else { 2 });
+    let clean = ok(notes::rename_note(&mut vault, &json!({"note": "Fine", "name": "Better"})));
+    assert_eq!(clean["relink_errors"], 0);
+    fs::remove_dir_all(root).unwrap();
 }

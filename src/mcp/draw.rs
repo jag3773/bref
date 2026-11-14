@@ -5,6 +5,8 @@ use std::{collections::{HashMap, HashSet}, fs};
 
 use serde_json::{Value, json};
 
+use crate::ui::assets::APP_FONTS;
+
 use crate::{
     logic::{
         diagram::{self, Diagram, End, Form, Head, Route},
@@ -20,15 +22,15 @@ use super::{Outcome, Server, arg_opt, arg_str, disk, vault::{self, Vault}};
 const FLOW: &str = "this Mermaid diagram cannot become a canvas (only classDiagram, sequenceDiagram and stateDiagram can). Put it in a note as a ```mermaid block, then render that block.";
 const NEWER: &str = "this diagram was written by a newer version of Bref and is read-only";
 
-/// Stable names of the library's starting points, in the order `library::templates` returns them.
-const TEMPLATES: [&str; 8] = ["class", "use-case", "package", "state", "sequence", "activity", "component", "deployment"];
-
-/// The key an agent passes for each family of the library, by its English name (`bref mcp`
-/// speaks English: `lang::speak_english`).
-const FAMILIES: [(&str, &str); 6] = [("Class", "class"), ("Use case", "use-case"), ("State machine", "state"), ("Activity", "activity"), ("Component", "component"), ("Sequence", "sequence")];
-
-fn family_key(family: &str) -> &'static str {
-    FAMILIES.iter().find(|(name, _)| *name == family).map_or("other", |(_, key)| key)
+/// The families an agent can ask for: the stable keys of `library::Preset::family_key`.
+fn family_keys() -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = Vec::new();
+    for preset in library::presets() {
+        if !keys.contains(&preset.family_key) {
+            keys.push(preset.family_key);
+        }
+    }
+    keys
 }
 
 pub fn check_mermaid(args: &Value) -> Outcome {
@@ -151,7 +153,7 @@ pub fn edit_diagram(vault: &mut Vault, args: &Value) -> Outcome {
             Err(message) => return Outcome::err(message),
         }
     }
-    draft.fit_sequence();
+    draft.normalise();
     if let Err(message) = files::write(&path, &draft.to_svg(diagram::COLORS[0])).map_err(disk) {
         return Outcome::err(message);
     }
@@ -198,17 +200,17 @@ pub fn import_diagram(vault: &mut Vault, args: &Value) -> Outcome {
 /// What `diagram_library` returns, also served at `bref://library`.
 pub fn library_value(family: Option<&str>) -> Result<Value, String> {
     if let Some(family) = family
-        && !FAMILIES.iter().any(|(_, key)| *key == family)
+        && !family_keys().contains(&family)
     {
         return Err(format!("unknown family `{family}`"));
     }
     let shapes: Vec<Value> = library::presets()
         .into_iter()
-        .filter(|preset| family.is_none_or(|key| family_key(preset.family) == key))
+        .filter(|preset| family.is_none_or(|key| preset.family_key == key))
         .map(|preset| {
             json!({
-                "family": family_key(preset.family),
-                "form": form_name(preset.form),
+                "family": preset.family_key,
+                "form": preset.form.name(),
                 "name": preset.name,
                 "text": preset.text,
                 "w": preset.w,
@@ -220,8 +222,7 @@ pub fn library_value(family: Option<&str>) -> Result<Value, String> {
         .collect();
     let templates: Vec<Value> = library::templates()
         .into_iter()
-        .enumerate()
-        .map(|(i, template)| json!({"key": TEMPLATES.get(i).copied().unwrap_or("diagram"), "name": template.name}))
+        .map(|template| json!({"key": template.key, "name": template.name}))
         .filter(|row| family.is_none_or(|name| row["key"] == name))
         .collect();
     Ok(json!({
@@ -290,9 +291,9 @@ fn mermaid_kind(source: &str) -> &'static str {
 
 fn look(dark: bool) -> figure::Look {
     if dark {
-        figure::Look { dark: true, bg: "#1e1e1e".into(), fill: "#2a2a2a".into(), text: "#e6e6e6".into(), line: "#9a9a9a".into(), font: "sans-serif".into() }
+        figure::Look { dark: true, bg: "#1e1e1e".into(), fill: "#2a2a2a".into(), text: "#e6e6e6".into(), line: "#9a9a9a".into(), font: "sans-serif".into(), fonts: APP_FONTS }
     } else {
-        figure::Look { dark: false, bg: "#ffffff".into(), fill: "#f3f3f3".into(), text: "#1c1c1c".into(), line: "#5c5c5c".into(), font: "sans-serif".into() }
+        figure::Look { dark: false, bg: "#ffffff".into(), fill: "#f3f3f3".into(), text: "#1c1c1c".into(), line: "#5c5c5c".into(), font: "sans-serif".into(), fonts: APP_FONTS }
     }
 }
 
@@ -336,15 +337,15 @@ fn mermaid_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current = String::new();
     let mut open = false;
+    // Same pairing as `markdown::walk`: a mermaid fence never closed is pushed nowhere, so it opens
+    // nothing. Kept as a loop of its own because it needs the text of the block, not the place of lines.
     for line in text.lines() {
         if crate::logic::markdown::is_fence(line) {
             if open {
                 blocks.push(std::mem::take(&mut current));
                 open = false;
             } else {
-                let info = line.trim_start().trim_start_matches('`').trim();
-                let word = info.split_whitespace().next().unwrap_or("");
-                open = word.eq_ignore_ascii_case("mermaid");
+                open = crate::logic::markdown::is_mermaid_fence(line);
             }
             continue;
         }
@@ -358,11 +359,11 @@ fn mermaid_blocks(text: &str) -> Vec<String> {
 
 /// A dark render is drawn on a dark ground: light ink on white is unreadable.
 fn raster(svg: &str, width: Option<f32>, dark: bool) -> Result<(Vec<u8>, u32, u32), String> {
-    let tree = svg::parse(svg).ok_or("the picture could not be drawn")?;
+    let tree = svg::parse(svg, APP_FONTS).ok_or("the picture could not be drawn")?;
     let (w, h) = (tree.size().width().max(1.), tree.size().height().max(1.));
     let want = width.map(|px| px / w).unwrap_or(2.).max(0.05);
     let scale = svg::scale_for(w, h, want);
-    let png = figure::png(svg, scale, if dark { 0x1e1e1e } else { 0xffffff }).ok_or("the picture could not be drawn")?;
+    let png = figure::png(svg, APP_FONTS, scale, if dark { 0x1e1e1e } else { 0xffffff }).ok_or("the picture could not be drawn")?;
     let (pw, ph) = png_size(&png);
     Ok((png, pw, ph))
 }
@@ -391,7 +392,7 @@ fn build(from: &Value) -> Result<(Diagram, usize), String> {
     }
     if let Some(name) = template {
         let made = library::templates();
-        let at = TEMPLATES.iter().position(|key| *key == name).or_else(|| made.iter().position(|template| template.name == name));
+        let at = made.iter().position(|template| template.key == name || template.name == name);
         let Some(at) = at else {
             return Err(format!("no template named `{name}`"));
         };
@@ -435,7 +436,7 @@ fn build(from: &Value) -> Result<(Diagram, usize), String> {
             keys.insert(key.to_string(), id);
         }
     }
-    diagram.fit_sequence();
+    diagram.normalise();
     let _ = (made_shapes, made_links);
     Ok((diagram, 0))
 }
@@ -524,8 +525,8 @@ fn add_shape(diagram: &mut Diagram, spec: &Value) -> Result<(u32, bool), String>
     let placed = spec.get("x").is_some() || spec.get("y").is_some();
     let x = spec.get("x").and_then(|v| v.as_f64()).unwrap_or(0.) as f32;
     let y = spec.get("y").and_then(|v| v.as_f64()).unwrap_or(0.) as f32;
-    let id = diagram.add_shape(form, x, y, w, h);
-    let shape = diagram.shape_mut(id).unwrap();
+    let shape = diagram.add_shape_mut(form, x, y, w, h);
+    let id = shape.id;
     shape.text = text;
     if let Some(color) = spec.get("color").and_then(|v| v.as_u64()) {
         if color > 5 {
@@ -544,24 +545,7 @@ fn add_shape(diagram: &mut Diagram, spec: &Value) -> Result<(u32, bool), String>
 
 fn size_of(form: Form, text: &str, w: Option<f32>, h: Option<f32>) -> (f32, f32) {
     let lines: Vec<String> = if text.is_empty() { Vec::new() } else { text.split('\n').map(str::to_string).collect() };
-    let min = match form {
-        Form::Dot => (20., 20.),
-        Form::Final => (26., 26.),
-        Form::Pin => (14., 14.),
-        Form::Bar => (90., 8.),
-        Form::Exit | Form::Terminate => (24., 24.),
-        Form::Actor => (40., 80.),
-        Form::Branch => (40., 40.),
-        Form::Lifeline => (110., 200.),
-        Form::Divider => (200., 10.),
-        Form::Package => (220., 160.),
-        Form::Frame | Form::Composite => (300., 200.),
-        Form::Node => (300., 200.),
-        Form::Lane => (200., 280.),
-        Form::Row => (420., 140.),
-        Form::Fragment => (280., 140.),
-        _ => (120., 48.),
-    };
+    let min = form.default_size();
     let (fw, fh) = diagram::fit(&lines, min);
     (w.unwrap_or(fw), h.unwrap_or(fh))
 }
@@ -577,8 +561,8 @@ fn add_link(diagram: &mut Diagram, spec: &Value, keys: &HashMap<String, u32>) ->
         let link = diagram.link_mut(id).unwrap();
         link.start = start;
         link.dashed = dashed;
-        relation.apply(link);
         fill_link(link, spec);
+        relation.apply(link);
         return Ok(id);
     }
     if let Some(heads) = spec.get("heads") {
@@ -664,11 +648,7 @@ fn resolve_key(key: &str, keys: &HashMap<String, u32>) -> Result<u32, String> {
 }
 
 fn form_of(name: &str) -> Result<Form, String> {
-    Form::ALL.iter().find(|(_, known)| *known == name).map(|(form, _)| *form).ok_or_else(|| format!("unknown form `{name}`"))
-}
-
-fn form_name(form: Form) -> &'static str {
-    Form::ALL.iter().find(|(known, _)| *known == form).map(|(_, name)| *name).unwrap_or("rect")
+    Form::named(name).ok_or_else(|| format!("unknown form `{name}`"))
 }
 
 fn head_of(name: &str) -> Result<Head, String> {
@@ -902,7 +882,7 @@ fn described(diagram: &Diagram, path: &str, read_only: bool) -> Value {
         .map(|shape| {
             json!({
                 "id": shape.id,
-                "form": form_name(shape.form),
+                "form": shape.form.name(),
                 "text": shape.text,
                 "x": shape.x,
                 "y": shape.y,

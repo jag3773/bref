@@ -7,6 +7,7 @@ mod board_header;
 mod calendar_head;
 mod canvas_nesting;
 mod sheet_header;
+mod sheet_widths;
 mod table_open;
 mod docks;
 mod drops;
@@ -18,15 +19,21 @@ mod feedback;
 mod floating;
 mod find_bar;
 mod vault_find;
+mod vault_health;
 mod keyboard;
 mod keycaps;
+mod layers;
 mod layout;
 mod motion;
+mod settings_page;
 mod shortcuts_page;
+mod palette_commands;
 mod panel_rows;
 mod canvas_text;
 mod current_file;
 mod panes;
+mod render_pure;
+mod paste_failure;
 mod tabs;
 mod save_close;
 mod sharing;
@@ -36,48 +43,55 @@ use super::*;
 use crate::{logic::block, ui::theme::contrast, views::editor::grid};
 use gpui::{Hsla, TestAppContext};
 
-static CONFIG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// The vault watcher looks at the disk every 2 s (`shell/library.rs`): a little more than one round.
+// ponytail: copied from library.rs, whose timers are not exported; export them there and use them here.
+pub(super) const WATCH: Duration = Duration::from_secs(3);
+/// A note's autosave (`SAVE_DELAY`) with some margin; the table's, 400 ms too, fires within it.
+pub(super) const SAVED: Duration = notes::SAVE_DELAY.saturating_add(Duration::from_millis(100));
 
-/// The layers only depend downwards: `logic` and `platform` never see gpui nor the layers
-/// above them, `ui` never sees the views, and the views never see the shell, whose code stays
-/// in `src/shell`. See ARCHITECTURE.md.
-#[test]
-fn layers_only_depend_downwards() {
-    // Spelled in two pieces: this file lives in src/shell, and the scan reads the source.
-    let server = concat!("crate::", "mcp");
-    let rules: &[(&str, &[&str])] = &[
-        ("src/logic", &["gpui", "crate::platform", "crate::ui", "crate::views", "crate::shell", server]),
-        ("src/platform", &["gpui", "crate::ui", "crate::views", "crate::shell", server]),
-        ("src/ui", &["crate::views", "crate::shell", "impl Shell", server]),
-        ("src/views", &["crate::shell", "impl Shell", server]),
-        ("src/shell", &[server]),
-        // The server uses logic, platform and the pure parts of ui. It never sees a window.
-        ("src/mcp", &["gpui", "crate::views", "crate::shell", "impl Shell"]),
-    ];
-    fn files(dir: &Path) -> Vec<PathBuf> {
-        let entries = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path());
-        entries.flat_map(|path| if path.is_dir() { files(&path) } else { vec![path] }).collect()
+/// Lets the vault watcher see what changed on disk: two of its rounds, the window drawn after each.
+pub(super) fn watch(cx: &mut gpui::VisualTestContext) {
+    for _ in 0..2 {
+        cx.executor().advance_clock(WATCH);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
     }
-    for (dir, banned) in rules {
-        for path in files(Path::new(dir)) {
-            let code = fs::read_to_string(&path).unwrap();
-            // Comments may name anything; only code counts.
-            let code: String = code.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
-            for word in *banned {
-                assert!(!code.contains(word), "{} uses `{word}`", path.display());
-            }
-        }
+}
+
+/// Frames until the layout settles, without the clock moving (toasts and fades keep their time).
+pub(super) fn settle(cx: &mut gpui::VisualTestContext) {
+    for _ in 0..4 {
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
     }
+    cx.run_until_parked();
+}
+
+/// What tests ask of the panel and what they set up in it, so that they do not reach into `Nav`.
+impl Shell {
+    /// The panel's tool and its size: (tool, panel mode).
+    pub(super) fn panel_view(&self) -> (crate::views::nav::Mode, crate::views::nav::Panel) {
+        (self.nav.mode(), self.nav.panel())
+    }
+
+    /// Shows `mode` alone in the panel, in `panel` mode.
+    pub(super) fn show_panel(&mut self, mode: crate::views::nav::Mode, panel: crate::views::nav::Panel, cx: &mut Context<Self>) {
+        self.nav.show_alone(mode);
+        self.nav.set_panel(panel);
+        cx.notify();
+    }
+}
+
+/// Every file under `dir`, folders walked.
+fn files(dir: &Path) -> Vec<PathBuf> {
+    let entries = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path());
+    entries.flat_map(|path| if path.is_dir() { files(&path) } else { vec![path] }).collect()
 }
 
 /// The shapes come from the theme (`t.small()`, `t.large()`, `t.lifted()`, `t.floating()`, `t.hover`): a view that
 /// writes a raw radius, a raw shadow or a hover in the colour of the lines brings back the drift of seven radii.
 #[test]
 fn shapes_come_from_the_theme() {
-    fn files(dir: &Path) -> Vec<PathBuf> {
-        let entries = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path());
-        entries.flat_map(|path| if path.is_dir() { files(&path) } else { vec![path] }).collect()
-    }
     let banned = [".rounded(px(", ".rounded(t.px(", "BoxShadow", ".shadow_sm", ".shadow_md", ".shadow_lg", ".shadow_xs", ".shadow_2xs", ".shadow_none", "s.bg(t.border)"];
     for path in files(Path::new("src/views")).into_iter().chain(files(Path::new("src/shell"))).chain(files(Path::new("src/ui"))) {
         if path.starts_with("src/shell/tests") || path.ends_with("theme.rs") || path.extension().is_none_or(|e| e != "rs") {
@@ -97,10 +111,6 @@ fn shapes_come_from_the_theme() {
 /// a text of the app. Action labels stay in the infinitive.
 #[test]
 fn french_says_vous() {
-    fn files(dir: &Path) -> Vec<PathBuf> {
-        let entries = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path());
-        entries.flat_map(|path| if path.is_dir() { files(&path) } else { vec![path] }).collect()
-    }
     let tu = [" tes ", " ton ", " ta ", "Tes ", "Ton ", " tu ", "Tu ", "-toi", " t'", "réessaie", "vérifie ", "installe-le", "Tape ", "Écris ", " écris ", "Ouvre ", "Choisis ", " fais ", "Rouvre-", "commence-"];
     for path in files(Path::new("src")).into_iter().filter(|p| !p.starts_with("src/shell/tests") && p.extension().is_some_and(|e| e == "rs")) {
         let code = fs::read_to_string(&path).unwrap();
@@ -116,21 +126,50 @@ fn french_says_vous() {
     }
 }
 
-/// The config folder is global to the process (environment variables): a test that moves it under
-/// `root` holds the lock until it ends, so that another does not move it while it uses it.
-fn isolated_config(root: &Path) -> std::sync::MutexGuard<'static, ()> {
-    let guard = CONFIG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    for key in ["XDG_CONFIG_HOME", "HOME", "APPDATA", "USERPROFILE"] {
-        unsafe { std::env::set_var(key, root.join(".config")) };
+/// The config folder is global to the process: a test that moves it under `root` holds the guard
+/// until it ends, so that another does not move it while it uses it.
+fn isolated_config(root: &Path) -> crate::platform::config::Isolated {
+    crate::platform::config::isolate(root)
+}
+
+/// A temporary folder named after the test, the process and a counter, empty at the start and removed when it goes out of
+/// scope, so a failing test leaves nothing behind either. It reads as a `PathBuf`.
+pub(super) struct TempDir(PathBuf);
+
+impl TempDir {
+    pub(super) fn new(name: &str) -> Self {
+        // A counter besides the name: two tests may pick the same name and run at the same time.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("bref-{name}-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
     }
-    guard
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A shell on a fresh vault in a temporary folder.
-pub(super) fn start<'a>(cx: &'a mut TestAppContext, name: &str) -> (PathBuf, Entity<Shell>, &'a mut gpui::VisualTestContext, std::sync::MutexGuard<'static, ()>) {
-    let root = std::env::temp_dir().join(format!("bref-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+pub(super) fn start<'a>(cx: &'a mut TestAppContext, name: &str) -> (TempDir, Entity<Shell>, &'a mut gpui::VisualTestContext, crate::platform::config::Isolated) {
+    let root = TempDir::new(name);
     let config = isolated_config(&root);
     cx.update(bind_keys);
     cx.update(init_fonts);

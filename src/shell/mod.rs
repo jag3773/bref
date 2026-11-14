@@ -4,10 +4,12 @@
 
 mod board;
 mod capture;
+mod command_table;
 mod diagrams;
 mod docks;
 mod drops;
 mod files;
+mod health;
 mod help;
 mod keymap;
 mod library;
@@ -20,6 +22,7 @@ mod print;
 mod render;
 mod search;
 mod settings;
+mod settings_page;
 mod sharing;
 mod sidebar;
 mod sync;
@@ -30,6 +33,7 @@ mod toasts;
 mod travel;
 mod updates;
 
+use crate::platform::config;
 use capture::*;
 use drops::*;
 use help::*;
@@ -43,7 +47,7 @@ use crate::lang::{date_name, time_name, tr};
 use crate::logic::{self, commands, diagram, embed, history, import, layout::{self, Node, Side, Zone}, markdown, prefs::Prefs, recall, table};
 use crate::platform::{self, clock::{clock, today}, git, update, vault};
 use crate::ui::{self,
-    assets::{Assets, FAMILIES, init_fonts, apply_fonts, logo, mono, sans},
+    assets::{Assets, FAMILIES, init_fonts, logo},
     figure, line,
     theme::{Page, THEMES, Theme, Wide},
     widgets::{drag_window, icon_button, icon_button_over, keycaps},
@@ -68,7 +72,7 @@ use gpui::{
 
 use canvas::{Canvas, CanvasEvent};
 use diagram::Diagram;
-use editor::{Editor, EditorEvent};
+use editor::{Chrome, Editor, EditorEvent};
 use graph::{Graph, GraphEvent};
 use history::{History, Place, Shown};
 use markdown::Link;
@@ -140,8 +144,16 @@ struct Shell {
     graph: Entity<Graph>,
     /// Notes or their links changed since the graph was last computed.
     graph_stale: bool,
+    /// The vault health page: a scan is running, the index changed since the last one began, and
+    /// how many broken links there were when the page was last looked at (the palette's dot).
+    health_running: bool,
+    health_stale: bool,
+    health_seen: Option<usize>,
     palette: Option<Entity<Palette>>,
     vault: Option<PathBuf>,
+    /// The first read of the vault is still running: the watcher waits for it, rather than read
+    /// every note a second time next to it.
+    scanning: bool,
     notes: Vec<Note>,
     /// Vault folders, including those that contain no note.
     dirs: Vec<PathBuf>,
@@ -189,6 +201,8 @@ struct Shell {
     copied: bool,
     /// The help panel, open or not.
     help: Help,
+    /// The settings page: its section, search and picked row (the tab itself is `Shown::Settings`).
+    settings: settings_page::SettingsPage,
     /// What was shown, for "back" and "forward".
     history: History,
     /// The bindings in effect, and what the user changed in the default shortcuts.
@@ -216,11 +230,22 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let prefs = Prefs::parse(&vault::load_settings());
-        apply_fonts(&prefs);
+        let prefs = Prefs::parse(&config::load(config::File::Settings));
         let theme = Theme::of(&prefs, window.appearance());
         let pane = Self::new_pane(theme, window, cx);
         cx.observe_window_appearance(window, |this, window, cx| this.restyle(window, cx)).detach();
+        // Whatever the shell changes ends in a `notify`: the state that follows from it is settled
+        // there (`sync_after_change`), never while drawing.
+        cx.observe_in(&cx.entity(), window, |this, _, window, cx| this.sync_after_change(window, cx)).detach();
+        // Nothing holds input anymore (the tab that had it is gone from the screen): it goes back to the active pane.
+        cx.observe_window_bounds(window, |this, window, cx| this.sync_after_change(window, cx)).detach();
+        cx.on_focus_lost(window, |this, window, cx| {
+            this.sync_after_change(window, cx);
+            // The view that held input is released after this callback: a second pass finds its
+            // focus handle gone, and gives input to the note.
+            cx.defer_in(window, |this, window, cx| this.sync_after_change(window, cx));
+        })
+        .detach();
         let shell = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             shell.update(cx, |this, cx| this.may_close_window(window, cx)).unwrap_or(true)
@@ -233,7 +258,7 @@ impl Shell {
 
         let nav = Nav::new(cx.focus_handle());
         // The graph shares the panel's focus: the same keys navigate it.
-        let graph = cx.new(|_| Graph::new(nav.focus.clone(), theme));
+        let graph = cx.new(|_| Graph::new(nav.focus().clone(), theme));
         cx.subscribe_in(&graph, window, |this, _, event, window, cx| match event {
             GraphEvent::Select(path) => this.select_from_graph(path, window, cx),
             GraphEvent::Open(path) => this.open_from_nav(path, window, cx),
@@ -272,8 +297,12 @@ impl Shell {
             nav,
             graph,
             graph_stale: true,
+            health_running: false,
+            health_stale: true,
+            health_seen: None,
             palette: None,
             vault: None,
+            scanning: false,
             notes: Vec::new(),
             dirs: Vec::new(),
             images: Vec::new(),
@@ -299,6 +328,7 @@ impl Shell {
             edge: None,
             copied: false,
             help: Help::default(),
+            settings: settings_page::SettingsPage::new(cx),
             history: History::default(),
             bound: defaults(),
             changes: keys::Changes::new(),
@@ -309,18 +339,19 @@ impl Shell {
                 this.recent = recent.into_iter().filter(|p| p.is_file()).collect();
                 // The tabs of last time, those whose file is still there; the older formats left
                 // the first pane to the most recent note.
-                let panes = vault::load_file("panes");
+                let panes = config::load(config::File::Panes);
                 let (tree, saved) = read_panes(&panes);
                 this.restore_panes(tree, saved, panes.starts_with("v3 "), &root, window, cx);
                 this.panes_saved = this.panes_state();
-                if this.nav.panel == Panel::Full {
-                    window.focus(&this.nav.focus);
+                if this.nav.panel() == Panel::Full {
+                    window.focus(this.nav.focus());
                 }
             }
             None => window.focus(&this.focus),
         }
         this.watch(cx);
         this.listen(window, cx);
+        this.sync_after_change(window, cx);
         this.check_updates(cx);
         let weak = cx.weak_entity();
         this.help.key_tap = Some(cx.intercept_keystrokes(move |event, window, cx| {
@@ -339,7 +370,7 @@ impl Shell {
         }));
         // Changed shortcuts; a faulty line of the file is dropped and reported.
         let open = editable();
-        let (changes, faults) = keys::read(&vault::load_file("keys"), &this.bound, &|action| open.contains(action));
+        let (changes, faults) = keys::read(&config::load(config::File::Keys), &this.bound, &|action| open.contains(action));
         if !changes.is_empty() {
             this.changes = changes;
             this.rebind(cx);
@@ -363,7 +394,7 @@ pub fn run() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_window_closed(|cx| cx.quit()).detach();
 
-        let (vault, recent) = vault::load_config();
+        let (vault, recent) = config::load_config();
         let lost = vault.clone().filter(|v| !v.is_dir());
         let vault = vault.filter(|v| v.is_dir());
         // `bref --capture`: the input line alone, in a small undecorated window.

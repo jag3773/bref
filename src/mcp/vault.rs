@@ -12,9 +12,9 @@ use notify::RecommendedWatcher;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    logic::{rank, wiki},
+    logic::{markdown, rank, wiki},
     logic::note::Note,
-    platform::vault::{self, Signal},
+    platform::{signal::Signal, vault},
 };
 
 use super::disk;
@@ -108,7 +108,7 @@ impl Vault {
             let path = self.inside(note, false)?;
             return self.notes.iter().find(|n| n.path == path).ok_or_else(|| format!("no note at `{note}`"));
         }
-        let name = note.split(['#', '|']).next().unwrap_or(note).trim();
+        let name = markdown::WikiLink::parse(note).target();
         if name.is_empty() {
             return Err("the note's name is empty".into());
         }
@@ -220,10 +220,7 @@ pub fn suggest(notes: &[Note], query: &str) -> Option<String> {
     best.filter(|(score, _)| *score > 0).map(|(_, name)| name.to_string())
 }
 
-/// Path of `path` relative to the vault, with `/` even on Windows.
-pub fn rel(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
-}
+pub use crate::platform::vault::rel;
 
 pub fn folder(root: &Path, path: &Path) -> String {
     path.parent().and_then(|dir| dir.strip_prefix(root).ok()).map(|dir| dir.to_string_lossy().replace('\\', "/")).unwrap_or_default()
@@ -244,34 +241,20 @@ pub fn read_text(path: &Path) -> Result<(String, String), String> {
     Ok((text, rev))
 }
 
-/// A file of this name, ignoring case, already in `dir`.
+/// A file `name.extension` (ignoring case) already in `dir`.
 pub fn name_taken(dir: &Path, name: &str, extension: &str) -> Option<PathBuf> {
-    let want = name.to_lowercase();
-    fs::read_dir(dir).ok()?.flatten().map(|entry| entry.path()).find(|path| {
-        path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(extension)) && vault::stem(path).to_lowercase() == want
-    })
+    vault::name_taken(dir, &format!("{name}.{extension}"))
 }
 
 fn disk_kind(kind: io::ErrorKind) -> String {
-    disk(io::Error::new(kind, ""))
+    disk(io::Error::from(kind))
 }
 
 /// Rewrites `[[old]]` into `[[new]]` in every note that links to it, unless another note
-/// is still called `old`. Returns how many notes changed.
-pub fn relink(vault: &mut Vault, old: &str, new: &str) -> usize {
+/// is still called `old`. Returns how many notes changed and how many could not be rewritten.
+pub fn relink(vault: &mut Vault, old: &str, new: &str) -> (usize, usize) {
     vault.rescan();
-    let Some(targets) = wiki::relink_set(&vault.notes, old, new) else {
-        return 0;
-    };
-    let paths: Vec<PathBuf> = targets.iter().map(|n| n.path.clone()).collect();
-    let mut changed = 0;
-    for path in paths {
-        let Ok(text) = fs::read_to_string(&path) else { continue };
-        let Some(fresh) = crate::logic::markdown::relink(&text, old, new) else { continue };
-        if vault::write(&path, &fresh).is_ok() {
-            changed += 1;
-        }
-    }
+    let done = vault::relink(Some(&vault.root), &mut vault.notes, old, new);
     vault.rescan();
-    changed
+    (done.rewritten.len(), done.failed.len())
 }

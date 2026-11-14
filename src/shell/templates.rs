@@ -15,11 +15,7 @@ impl Shell {
 
     /// The daily note template: the one called `Daily`, `Journal`, `Today`, `Note du jour`…
     pub(super) fn daily_template(&self) -> Option<PathBuf> {
-        let named: Vec<(PathBuf, String)> = self.templates().into_iter().map(|path| {
-            let stem = vault::stem(&path);
-            (path, stem)
-        }).collect();
-        logic::daily::pick(named.iter().map(|(path, stem)| (path.clone(), stem.as_str())))
+        vault::daily_template(self.templates())
     }
 
     /// A template to choose, then, for a new note, its name; or, to insert it, nothing else.
@@ -84,7 +80,7 @@ impl Shell {
             }
         };
         let path = dir.join(format!("{name}.md"));
-        if path.exists() {
+        if vault::name_taken(dir, &format!("{name}.md")).is_some() {
             self.say(Tone::Failed, format!("{} « {name} »", tr("A note already has the name", "Une note porte déjà le nom")), cx);
             return None;
         }
@@ -102,6 +98,9 @@ impl Shell {
 
     /// The template, filled with the open note's name, in place of the cursor.
     pub(super) fn insert_template(&mut self, template: &Path, cx: &mut Context<Self>) {
+        if !self.pane().shows_note() {
+            return;
+        }
         let text = match fs::read_to_string(template) {
             Ok(text) => text,
             Err(e) => return self.say(Tone::Failed, format!("{} : {}", tr("Template not read", "Modèle illisible"), crate::lang::io_reason(&e)), cx),
@@ -113,7 +112,7 @@ impl Shell {
 
     /// The open note, saved as a template: its title becomes `{{title}}`.
     pub(super) fn save_as_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.vault.is_none() || self.pane().file.is_some() || self.pane().listing.is_some() {
+        if self.vault.is_none() || !self.pane().shows_note() {
             return;
         }
         self.flush(cx);
@@ -124,7 +123,7 @@ impl Shell {
             let Some(root) = this.vault.clone() else { return };
             let dir = vault::template_dir(&root, &this.dirs).unwrap_or_else(|| root.join("Templates"));
             let path = dir.join(format!("{name}.md"));
-            if path.exists() {
+            if vault::name_taken(&dir, &format!("{name}.md")).is_some() {
                 return this.say(Tone::Failed, format!("{} « {name} »", tr("A template already has the name", "Un modèle porte déjà le nom")), cx);
             }
             match fs::create_dir_all(&dir).and_then(|()| vault::write(&path, &text)) {

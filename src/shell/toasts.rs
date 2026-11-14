@@ -34,6 +34,13 @@ impl Shell {
         self.say_undoable(tone, text, None, cx);
     }
 
+    /// Writes a config file; if that fails, the reason is shown (the choice holds until the app closes).
+    pub(super) fn keep(&mut self, file: config::File, text: &str, cx: &mut Context<Self>) {
+        if let Err(e) = config::save(file, text) {
+            self.say(Tone::Failed, format!("{} ({}): {e}", tr("Settings not saved", "Réglages non enregistrés"), config::path(file).display()), cx);
+        }
+    }
+
     /// `say`, with an « Undo » button that puts `undo.0` back at `undo.1`.
     pub(super) fn say_undoable(&mut self, tone: Tone, text: impl Into<String>, undo: Option<(PathBuf, PathBuf)>, cx: &mut Context<Self>) {
         let text = text.into();
@@ -82,7 +89,7 @@ pub(super) fn status_card(t: Theme) -> Div {
             .pl_3()
             .pr_2()
             .py_1p5()
-            .text_size(t.px(13.))
+            .text_size(t.font_body())
             .flex()
             .items_center()
             .gap_3()

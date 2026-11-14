@@ -1,5 +1,6 @@
 //! File operations from the side panel: new folder, move, rename, trash, and what follows on disk.
 
+use crate::platform::config;
 use std::path::{Path, PathBuf};
 use gpui::{Context, Window};
 use crate::{
@@ -15,10 +16,10 @@ impl Shell {
         if self.vault.is_none() {
             return;
         }
-        if self.nav.panel == Panel::Rail || self.nav.mode != Mode::Tree {
+        if self.nav.panel() == Panel::Rail || self.nav.mode() != Mode::Tree {
             self.show_nav(Mode::Tree, false, window, cx);
         }
-        self.menu_do(Do::NewFolder, self.nav.sel.clone(), window, cx);
+        self.menu_do(Do::NewFolder, self.nav.sel().clone(), window, cx);
     }
 
     /// A disk operation on `path` failed: what was tried, on which file, and why.
@@ -30,7 +31,7 @@ impl Shell {
     /// Moves everything that was dragged into the folder `dir`.
     pub(super) fn move_all(&mut self, from: &[PathBuf], dir: &Path, cx: &mut Context<Self>) {
         from.iter().for_each(|path| self.move_into(path, dir, cx));
-        self.nav.marked.clear();
+        self.nav.clear_marked();
     }
 
     /// Moves the note or folder `from` into the folder `dir`.
@@ -46,7 +47,7 @@ impl Shell {
         self.flush(cx);
         match vault::rename(from, &to) {
             Ok(()) => {
-                self.nav.open.insert(dir.to_path_buf());
+                self.nav.open_dir(dir.to_path_buf());
                 self.relocate(from, &to, false, cx);
             }
             Err(e) => self.fail(tr("Not moved", "Déplacement impossible"), from, e, cx),
@@ -56,26 +57,23 @@ impl Shell {
     /// `from` became `to` on disk: everything the app knows about it follows.
     pub(super) fn relocate(&mut self, from: &Path, to: &Path, reload: bool, cx: &mut Context<Self>) {
         self.history.rename(from, to);
+        crate::views::sheet::move_tables(from, to);
         let shift = |p: &PathBuf| match p.strip_prefix(from) {
             Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
             Ok(rest) => to.join(rest),
             Err(_) => p.clone(),
         };
-        for note in &mut self.notes {
-            note.path = shift(&note.path);
-            note.name = vault::stem(&note.path);
-        }
+        self.move_notes(shift);
         self.dirs = self.dirs.iter().map(shift).collect();
         self.images = self.images.iter().map(shift).collect();
         self.recent = self.recent.iter().map(shift).collect();
         // Icons follow their note or folder, and what it contains.
-        if self.icons.keys().any(|p| p.starts_with(from)) {
-            self.icons = self.icons.drain().map(|(path, icon)| (shift(&path), icon)).collect();
+        if vault::move_icons(&mut self.icons, from, to) {
             self.save_icons(cx);
         }
-        self.nav.open = self.nav.open.iter().map(shift).collect();
+        self.nav.set_open(self.nav.open().iter().map(shift).collect());
         self.each_pane(|this| {
-            if let Some(file) = &mut this.pane_mut().file {
+            if let Some(file) = this.pane_mut().file_mut() {
                 file.path = shift(&file.path);
                 if let super::FileKind::Sheet(sheet) = &file.kind {
                     let moved = file.path.clone();
@@ -99,15 +97,17 @@ impl Shell {
             Ok(trashed) => trashed,
             Err(e) => return self.fail(tr("Not moved to the trash", "Mise à la corbeille impossible"), path, e, cx),
         };
+        // What is kept for a table goes with it, and comes back with it.
+        crate::views::sheet::move_tables(path, &trashed);
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         self.say_undoable(Tone::Done, format!("{} « {name} »", tr("Moved to the trash:", "Mis à la corbeille :")), Some((trashed, path.to_path_buf())), cx);
         self.history.remove(path);
         let gone = |p: &PathBuf| p.starts_with(path);
-        self.notes.retain(|n| !gone(&n.path));
+        self.forget_notes(gone);
         self.dirs.retain(|d| !gone(d));
         self.images.retain(|p| !gone(p));
         self.recent.retain(|p| !gone(p));
-        self.nav.sel = None;
+        self.nav.set_sel(None);
         self.each_pane(|this| {
             if this.pane().file_path().is_some_and(gone) {
                 this.set_file(None, cx);
@@ -126,6 +126,7 @@ impl Shell {
         let made = to.parent().map_or(Ok(()), std::fs::create_dir_all);
         match made.and_then(|()| vault::rename(from, to)) {
             Ok(()) => {
+                crate::views::sheet::move_tables(from, to);
                 self.say(Tone::Done, format!("{} « {} »", tr("Put back:", "Remis en place :"), to.file_name().unwrap_or_default().to_string_lossy()), cx);
                 self.files_changed(cx);
             }
@@ -136,12 +137,10 @@ impl Shell {
     /// After a move or a deletion: config, completion and graph up to date.
     pub(super) fn files_changed(&mut self, cx: &mut Context<Self>) {
         if let Some(root) = &self.vault {
-            vault::save_config(root, &self.recent);
+            config::save_config(root, &self.recent);
         }
         self.calm();
-        self.push_names(cx);
-        self.graph_stale = true;
-        self.refresh_graph(cx);
+        self.index_changed(cx);
         cx.notify();
     }
 }

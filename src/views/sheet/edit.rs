@@ -2,7 +2,6 @@
 
 use super::*;
 
-pub(super) const UNDO_DEPTH: usize = 200;
 
 /// An edit gesture, and its inverse: undo applies the inverse and gets the gesture back.
 pub(super) enum Change {
@@ -10,8 +9,8 @@ pub(super) enum Change {
     Set(Vec<(usize, usize, String)>),
     Insert(usize, Vec<Vec<String>>),
     Remove(Range<usize>),
-    /// `n` columns before `at`, with their previous cells (none: empty).
-    InsertCols(usize, usize, Vec<Vec<String>>),
+    /// `n` columns before `at`, with their previous cells (none: empty) and widths (none: automatic).
+    InsertCols(usize, usize, Vec<Vec<String>>, Vec<Option<f32>>),
     RemoveCols(Range<usize>),
     /// The columns will start at `to` (counted once removed).
     MoveCols(Range<usize>, usize),
@@ -43,10 +42,16 @@ impl Sheet {
         self.mono.get(col).copied().unwrap_or(false)
     }
 
+    /// The text of the cell being edited.
+    #[cfg(test)]
+    pub fn edit_text(&self) -> Option<&str> {
+        self.edit.as_ref().map(|e| e.text.as_str())
+    }
+
     /// Number of gestures that can be undone.
     #[cfg(test)]
     pub fn undo_len(&self) -> usize {
-        self.undo.len()
+        self.history.len()
     }
 
     pub(super) fn begin_edit(&mut self, text: Option<&str>, cx: &mut Context<Self>) {
@@ -64,16 +69,6 @@ impl Sheet {
         let (r, c) = self.cursor;
         if *self.table.cell(r, c) != *edit.text {
             self.commit(vec![Change::Set(vec![(r, c, edit.text)])], cx);
-        }
-        cx.notify();
-    }
-
-    pub(super) fn typed(&mut self, text: &str, cx: &mut Context<Self>) {
-        match &mut self.edit {
-            Some(edit) => edit.insert(text),
-            // Typing on a cell replaces its content, as in a spreadsheet.
-            None if !text.chars().all(char::is_control) => self.begin_edit(Some(text), cx),
-            None => {}
         }
         cx.notify();
     }
@@ -104,22 +99,34 @@ impl Sheet {
                 self.table.remove_rows(range);
                 Change::Insert(at, rows)
             }
-            // Widths are measured again: `settle` sees they no longer fit the table.
-            Change::InsertCols(at, n, saved) => {
+            // The chosen widths follow their columns; the others are measured again: `settle` sees the
+            // widths no longer fit the table.
+            Change::InsertCols(at, n, saved, mut chosen) => {
+                let before = self.table.cols();
                 self.table.insert_cols(at, n, &saved);
+                chosen.resize(n, None);
+                self.chosen.resize(before, None);
+                widths::insert(&mut self.chosen, at, chosen);
                 self.widths.clear();
+                self.keep_widths();
                 Change::RemoveCols(at..at + n)
             }
             Change::RemoveCols(range) => {
                 let (n, at) = (range.len(), range.start);
+                self.chosen.resize(self.table.cols(), None);
+                let chosen = widths::remove(&mut self.chosen, range.clone());
                 let saved = self.table.remove_cols(range);
                 self.widths.clear();
-                Change::InsertCols(at, n, saved)
+                self.keep_widths();
+                Change::InsertCols(at, n, saved, chosen)
             }
             Change::MoveCols(range, to) => {
                 let back = Change::MoveCols(to..to + range.len(), range.start);
+                self.chosen.resize(self.table.cols(), None);
+                widths::shift(&mut self.chosen, range.clone(), to);
                 self.table.move_cols(range, to);
                 self.widths.clear();
+                self.keep_widths();
                 back
             }
             Change::Reorder(start, perm) => {
@@ -135,25 +142,34 @@ impl Sheet {
 
     /// Applies gestures together: a single "undo" reverts them.
     pub(super) fn commit(&mut self, changes: Vec<Change>, cx: &mut Context<Self>) {
-        let mut back: Vec<Change> = changes.into_iter().map(|c| self.apply(c)).collect();
-        back.reverse();
-        self.undo.push(back);
-        if self.undo.len() > UNDO_DEPTH {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
+        let back = self.invert(changes);
+        self.history.record(back);
         self.settle(cx);
     }
 
-    pub(super) fn restore(&mut self, redo: bool, cx: &mut Context<Self>) {
+    pub(super) fn undo(&mut self, cx: &mut Context<Self>) {
         self.finish(cx);
-        let Some(batch) = (if redo { self.redo.pop() } else { self.undo.pop() }) else {
-            return;
-        };
+        if let Some(batch) = self.history.undo() {
+            let back = self.invert(batch);
+            self.history.undone(back);
+            self.settle(cx);
+        }
+    }
+
+    pub(super) fn redo(&mut self, cx: &mut Context<Self>) {
+        self.finish(cx);
+        if let Some(batch) = self.history.redo() {
+            let back = self.invert(batch);
+            self.history.redone(back);
+            self.settle(cx);
+        }
+    }
+
+    /// Applies a batch and gets the batch that undoes it.
+    fn invert(&mut self, batch: Vec<Change>) -> Vec<Change> {
         let mut back: Vec<Change> = batch.into_iter().map(|c| self.apply(c)).collect();
         back.reverse();
-        if redo { &mut self.undo } else { &mut self.redo }.push(back);
-        self.settle(cx);
+        back
     }
 
     pub(super) fn settle(&mut self, cx: &mut Context<Self>) {
@@ -188,7 +204,7 @@ impl Sheet {
         // Whole columns: as many empty columns, to their right or left, selected in turn.
         if self.whole_cols() {
             let at = if below { cols.end } else { cols.start };
-            self.commit(vec![Change::InsertCols(at, cols.len(), Vec::new())], cx);
+            self.commit(vec![Change::InsertCols(at, cols.len(), Vec::new(), Vec::new())], cx);
             (self.anchor, self.cursor) = ((self.last_row(), at + cols.len() - 1), (0, at));
             return cx.notify();
         }
@@ -254,7 +270,7 @@ impl Sheet {
             TableOp::DeleteRow => self.delete_rows(cx),
             TableOp::ColLeft | TableOp::ColRight => {
                 let at = if op == TableOp::ColLeft { cols.start } else { cols.end };
-                self.commit(vec![Change::InsertCols(at, 1, Vec::new())], cx);
+                self.commit(vec![Change::InsertCols(at, 1, Vec::new(), Vec::new())], cx);
                 (self.anchor, self.cursor) = ((r, at), (r, at));
             }
             TableOp::DuplicateRow => {
@@ -264,7 +280,7 @@ impl Sheet {
             }
             TableOp::DuplicateCol => {
                 let saved = (0..tall).map(|r| self.table.cells(r, cols.clone()).into_iter().map(|c| c.into_owned()).collect()).collect();
-                self.commit(vec![Change::InsertCols(cols.end, cols.len(), saved)], cx);
+                self.commit(vec![Change::InsertCols(cols.end, cols.len(), saved, Vec::new())], cx);
                 (self.anchor, self.cursor) = ((r, cols.end), (r, cols.end));
             }
             // Only the body moves: the header stays at the top, and nothing leaves the table.

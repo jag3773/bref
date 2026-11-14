@@ -493,7 +493,7 @@ pub fn text_runs(t: &Theme, text: &str, flags: &[u16], marked: impl Fn(usize) ->
                     weight: if style.heading { FontWeight::SEMIBOLD } else if f & md::BOLD != 0 { FontWeight::BOLD } else { FontWeight::NORMAL },
                     style: if slanted { FontStyle::Italic } else { FontStyle::Normal },
                     // Titles follow the chosen font, in semibold (code spans stay mono).
-                    ..font(if code { mono() } else { sans() })
+                    ..font(if code { t.mono } else { t.sans })
                 },
                 color,
                 background_color: (f & md::CODE != 0).then_some(t.code_bg),
@@ -797,7 +797,8 @@ impl Editor {
                     && grid::geometry(&mut grid::Cache::default(), &text_system, &look, room, &lines).same(geom)
             })
         });
-        // A ``` without a closing fence opens no block: otherwise each ``` typed would
+        // The same pairing as `markdown::walk`, with one more thing it cannot know: the fence being
+        // typed (`orphan`) is left out of the count. A ``` without a closing fence opens no block: otherwise each ``` typed would
         // switch the whole rest of the note to code, hence restyle it. If
         // there is one too many, it is the one being typed (the cursor is on the line of the
         // last change), otherwise the last: a cursor merely resting on a fence of a closed
@@ -818,18 +819,11 @@ impl Editor {
         // A font without `≠` composes it from a `=` and a misplaced bar: might as well
         // leave `!=`.
         let has_unequal = text_system
-            .advance(text_system.resolve_font(&font(sans())), px(16.), '≠')
+            .advance(text_system.resolve_font(&font(t.sans)), px(16.), '≠')
             .is_ok();
         let mut lang = String::new();
         // Mermaid diagrams and LaTeX formulas: drawn once, reused afterwards.
-        let rgb = |c: Hsla| {
-            let c = Rgba::from(c);
-            [c.r, c.g, c.b].map(|v| (v * 255.) as u8)
-        };
-        let hex = |c: Hsla| {
-            let [r, g, b] = rgb(c);
-            format!("#{r:02x}{g:02x}{b:02x}")
-        };
+        let (rgb, hex) = (crate::ui::theme::rgb8, crate::ui::theme::hex);
         let look = figure::Look::of(&t);
         // A figure's key, and the key of its source alone.
         let key = |kind: u8, source: &str| {
@@ -841,13 +835,13 @@ impl Editor {
         };
         let style = {
             let mut hasher = Fast::default();
-            (key(0, "").0, hex(t.accent), mono(), has_unequal).hash(&mut hasher);
+            (key(0, "").0, hex(t.accent), t.mono, has_unequal).hash(&mut hasher);
             hasher.finish()
         };
         // Figures are drawn at the page's largest width, for this screen.
         let job = {
             let (room, density, bg) = (f32::from(t.page.measure(t.size)), window.scale_factor(), rgb(t.bg));
-            move |(key, family): (u64, u64), make: Arc<dyn Fn() -> Option<String> + Send + Sync>| Job { key, family, make, room, density, bg }
+            move |(key, family): (u64, u64), make: Arc<dyn Fn() -> Option<String> + Send + Sync>| Job { key, family, make, room, density, bg, fonts: (t.sans, t.mono) }
         };
         let vector = |figure: Option<figure::Figure>| {
             Some(figure.map(|(svg, w, h)| (Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())), size(px(w), px(h)))))
@@ -874,16 +868,7 @@ impl Editor {
         // Front matter: its lines are written faded, monospaced, without being interpreted.
         let meta = md::front_matter(&self.content);
         // Color of a `[!TYPE]` callout: its tint tells its type.
-        let tint_of = |label: &str| {
-            let h = match label.to_ascii_lowercase().as_str() {
-                "[!tip]" | "[!success]" => 0.38,
-                "[!important]" => 0.75,
-                "[!warning]" => 0.09,
-                "[!caution]" | "[!danger]" | "[!error]" => 0.,
-                _ => 0.58,
-            };
-            Hsla { h, s: 0.7, l: 0.5, a: 1. }
-        };
+        let tint_of = |label: &str| Hsla { h: crate::ui::theme::callout_hue(label), s: 0.7, l: 0.5, a: 1. };
         let mut tint;
         let mut loading = false;
         let mut big: Vec<BigBlock> = Vec::new();
@@ -975,7 +960,7 @@ impl Editor {
                 fences -= 1;
                 if opens {
                     lang = line.trim_start()[3..].trim().to_lowercase();
-                    block = (lang == "mermaid").then(|| (offset, String::new()));
+                    block = md::is_mermaid_fence(line).then(|| (offset, String::new()));
                 } else if let Some((start, source)) = block.take() {
                     // A diagram is drawn once the cursor has left the block, in a background task.
                     let editing = (start..=offset + line.len()).contains(&cursor);
@@ -1228,7 +1213,7 @@ impl Editor {
             // ponytail: one picture per line, looked up in the note's folder, at the
             // vault root, then by its name in the whole vault; inline
             // pictures (http) are not loaded.
-            let file = made.picture.as_ref().and_then(|path| find_picture(&self.dirs, &self.images, path));
+            let file = made.picture.as_ref().and_then(|path| find_picture(&self.dirs, &self.vault.images, path));
             let has_file = file.is_some();
             let svg = file.as_ref().is_some_and(|f| f.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")));
             // The picture wins over a formula on the same line: it is what is drawn.
@@ -1475,7 +1460,7 @@ impl Editor {
         // can still pass under them; that is worth no gap at the top of every note.
         let narrow = self.width + SIDE * 2. >= bounds.size.width;
         let text_right = bounds.left() + (bounds.size.width + self.width) / 2.;
-        self.top = if narrow && self.pill.is_some_and(|left| text_right > left) { PILL_CLEAR } else { TOP.max(self.strip) };
+        self.top = if narrow && self.chrome.pill.is_some_and(|left| text_right > left) { PILL_CLEAR } else { TOP.max(self.chrome.strip) };
         if reveal {
             let c = self.cursor();
             if let Some(r) = self.row_at(c) {
@@ -1620,7 +1605,7 @@ mod tests {
             .map(|r| {
                 let piece = text[at..at + r.len].to_string();
                 at += r.len;
-                (piece, r.font.style == FontStyle::Italic, r.font.family == mono())
+                (piece, r.font.style == FontStyle::Italic, r.font.family == t.mono)
             })
             .collect()
     }

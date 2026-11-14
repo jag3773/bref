@@ -17,13 +17,14 @@ A fast, minimal note-taking app. Notes are plain Markdown files in a folder you 
 - **Styled as you type.** Headings grow, bold and italics render, markers stay visible but dimmed. The file on disk stays plain Markdown.
 - **Tables that compute.** Cells wrap, `Tab` moves between them, pasting from a spreadsheet works, and `=sum(above)` adds up a column.
 - **Linked notes.** `[[Links]]`, backlinks, tags, embedded sections, a graph, and a calendar of daily notes. The tree follows the active file, including diagrams, pictures and tables.
-- **More than notes.** Kanban boards, list pages built from front matter, UML diagrams drawn by hand and saved as SVG, and a CSV grid that opens a million rows.
+- **More than notes.** Kanban boards, list pages built from front matter, UML diagrams drawn by hand and saved as SVG, and a CSV grid that opens a million rows, its columns as wide as you want.
+- **Vault health.** Broken links, orphan notes, unused pictures, empty notes and sync conflict copies, found from the palette and fixed in a click. Nothing is deleted. [Guide](book/src/health.md)
 - **Agents.** `bref mcp` lets an agent read, write and draw in the vault, with Bref's links, trash and diagrams. [Guide](book/src/agents.md)
 - **Safe tab closing.** Close a tab, the other tabs or a whole pane from a tab's right click, or every file from the palette. If saving fails, the document stays open with its edits and undo history.
 - **PDF to send.** A note saved as an A4 PDF from the palette, unsaved edits included: text you can search and copy, pictures, Mermaid diagrams and formulas drawn in. [How](book/src/writing.md#save-as-pdf)
 - **Local sharing.** Copy a whole note as Markdown or readable text, or save a separate copy. One Share / Export menu also offers SVG/PNG for diagrams and the existing table formats.
 - **Keyboard first.** One palette for notes and commands. Every shortcut is listed in the app (`F1`) and can be changed.
-- **Yours to dress.** 13 themes, IBM Plex built in, any installed font. Light and dark, English and French.
+- **Yours to dress.** 13 themes, IBM Plex built in, any installed font. Light and dark, English and French. Every setting in one tab: `Ctrl + ,`.
 
 ![Typing a note: the title grows, styles render, a table adds up its column](docs/screenshots/demo.gif)
 
@@ -80,7 +81,7 @@ The [user guide](book/src/introduction.md) covers everything. It is also publish
 | [CSV and TSV files](book/src/csv.md) | the grid |
 | [Files on disk](book/src/vault.md) | naming, front matter, backup, configuration files |
 | [Syncing a vault](book/src/sync.md) | git in one key, or a cloud folder |
-| [Settings and appearance](book/src/settings.md) | themes, fonts, page width, changing a shortcut |
+| [Settings and appearance](book/src/settings.md) | the settings tab (`Ctrl + ,`), themes, fonts, page width, changing a shortcut |
 | [Updates](book/src/updates.md) | how Bref updates itself, and what it sends |
 | [Keyboard shortcuts](book/src/shortcuts.md) | every shortcut, as the help panel lists them |
 | [Agents (MCP)](book/src/agents.md) | `bref mcp`: an agent reads, writes and draws in the vault |

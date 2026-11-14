@@ -25,7 +25,7 @@ pub enum FieldEvent {
 
 pub struct Field {
     focus: FocusHandle,
-    pub line: Line,
+    line: Line,
     theme: Theme,
     /// The text as last drawn, to place the cursor on a click and the input method's window.
     layout: Option<TextLayout>,
@@ -48,10 +48,40 @@ impl Field {
         self
     }
 
+    /// What is typed.
+    pub fn text(&self) -> &str {
+        &self.line.text
+    }
+
+    /// Nothing typed.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.line = Line::default();
+        cx.notify();
+    }
+
+    /// The text as it is, all selected: the next keystroke replaces it.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.line.select_all();
+        cx.notify();
+    }
+
     /// The text, replaced, all selected: the next keystroke replaces it.
     pub fn set(&mut self, text: &str, cx: &mut Context<Self>) {
         self.line = Line::new(text);
         self.line.select_all();
+        cx.notify();
+    }
+
+    /// Types `text` at the cursor, as the keyboard would (a key typed elsewhere, sent here).
+    pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.line.insert(text);
+        cx.emit(FieldEvent::Changed);
+        cx.notify();
+    }
+
+    /// Takes the colours of `theme` (chosen while the field is shown).
+    pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        self.theme = theme;
         cx.notify();
     }
 
@@ -123,7 +153,7 @@ impl Render for Field {
         let placed = layout.clone();
         let field = div()
             // The palette's keys (Enter confirms, Escape gives up) and those of a line.
-            .key_context("Palette Line")
+            .key_context(crate::ui::keys::context::PALETTE_LINE)
             .track_focus(&self.focus)
             .on_action(cx.listener(|_, _: &Confirm, _, cx| cx.emit(FieldEvent::Done)))
             .on_action(cx.listener(|_, _: &Dismiss, _, cx| cx.emit(FieldEvent::Cancel)))

@@ -122,6 +122,9 @@ pub struct Theme {
     pub bar: bool,
     /// Short fades when a panel, the format bar or a folder opens; off: everything is instant.
     pub motion: bool,
+    /// Fonts of the text and of the code: the chosen ones, otherwise the app's.
+    pub sans: &'static str,
+    pub mono: &'static str,
 }
 
 /// Offered themes: (name, [background, text, faint, accent, code background, panel, border]).
@@ -150,6 +153,7 @@ impl Theme {
         let (_, colors) = THEMES.iter().find(|t| t.0 == prefs.theme).unwrap_or(system);
         let [bg, text, dim, accent, code_bg, panel, border] = colors.map(|c| Hsla::from(rgb(c)));
         let ground = ground_of(bg);
+        let (sans, mono) = crate::ui::assets::chosen_fonts(prefs);
         // The selection, as strong as the text over it allows.
         let share = (0..=15)
             .map(|i| if bg.l < 0.5 { 0.25 } else { 0.2 } - i as f32 * 0.01)
@@ -194,6 +198,8 @@ impl Theme {
             wide: Wide::of(&prefs.wide),
             bar: prefs.bar != "off",
             motion: prefs.motion != "off",
+            sans,
+            mono,
         }
     }
 }
@@ -202,6 +208,16 @@ impl Theme {
     /// `v` pixels of the interface at its scale.
     pub fn px(&self, v: f32) -> Pixels {
         px(v * self.ui)
+    }
+
+    /// Secondary text: labels, hints, buttons of the tools (12 px at scale 1).
+    pub fn font_small(&self) -> Pixels {
+        self.px(12.)
+    }
+
+    /// Running interface text: rows, fields, menus (13 px at scale 1).
+    pub fn font_body(&self) -> Pixels {
+        self.px(13.)
     }
 
     /// The small radius of the interface: fields, buttons, pills, rows.
@@ -229,6 +245,21 @@ impl Theme {
     #[allow(dead_code)] // used by the views from step 3 of #91
     pub fn band(&self) -> Pixels {
         self.px(10.)
+    }
+
+    /// The selection of a row in a list that has lost the focus: half of `selection`.
+    pub fn selection_idle(&self) -> Hsla {
+        self.selection.opacity(0.5)
+    }
+
+    /// The fill of the place where a dragged item would land (a drop zone, a folder under the pointer).
+    pub fn drop_tint(&self) -> Hsla {
+        self.accent.opacity(0.12)
+    }
+
+    /// The tint of what is open (a pill, the open row of the panel): the accent at 10 %, quieter than the selection.
+    pub fn pill_tint(&self) -> Hsla {
+        self.accent.opacity(0.1)
     }
 
     /// What sits on the page: tooltips, the dragged card, the bars over a canvas.
@@ -296,9 +327,35 @@ const HIGHLIGHTS: [f32; 5] = [0.14, 0.36, 0.58, 0.93, 0.76];
 
 /// The five hues of the callout recipe: green, purple, orange, red, blue.
 #[cfg(test)]
-const HUES: [f32; 5] = [GREEN, 0.75, 0.09, RED, 0.58];
+const HUES: [f32; 5] = [GREEN, PURPLE, ORANGE, RED, BLUE];
 pub const GREEN: f32 = 0.38;
 pub const RED: f32 = 0.;
+const PURPLE: f32 = 0.75;
+const ORANGE: f32 = 0.09;
+const BLUE: f32 = 0.58;
+
+/// The hue of a `[!TYPE]` callout (label with its brackets, any case): its tint tells its type.
+pub fn callout_hue(label: &str) -> f32 {
+    match label.to_ascii_lowercase().as_str() {
+        "[!tip]" | "[!success]" => GREEN,
+        "[!important]" => PURPLE,
+        "[!warning]" => ORANGE,
+        "[!caution]" | "[!danger]" | "[!error]" => RED,
+        _ => BLUE,
+    }
+}
+
+/// The color as three 8-bit channels, each rounded to the nearest.
+pub fn rgb8(c: Hsla) -> [u8; 3] {
+    let c = c.to_rgb();
+    [c.r, c.g, c.b].map(|v| (v * 255.).round() as u8)
+}
+
+/// The color as `#rrggbb` (opaque; see `rgb8`).
+pub fn hex(c: Hsla) -> String {
+    let [r, g, b] = rgb8(c);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
 
 /// Relative luminance of a color, in the WCAG sense.
 fn luminance(color: Hsla) -> f32 {
@@ -340,6 +397,14 @@ pub fn blend(top: Hsla, under: Hsla, share: f32) -> Hsla {
 mod tests {
     use super::*;
     use gpui::WindowAppearance;
+
+    /// A font change is a theme change: views compare themes to know whether to redraw.
+    #[test]
+    fn fonts_are_part_of_the_theme() {
+        let theme = Theme::of(&Prefs::parse("theme=Bref Light\n"), WindowAppearance::Light);
+        assert_eq!((theme.sans, theme.mono), crate::ui::assets::APP_FONTS);
+        assert!(theme != Theme { sans: "Other", ..theme } && theme != Theme { mono: "Other", ..theme });
+    }
 
     /// In each theme, secondary text, the accent (links, tags) and the title of a `[!TIP]`
     /// callout read: at least 4.5:1 (WCAG AA).
@@ -414,15 +479,15 @@ mod tests {
                 ("accent/selection", t.accent, picked, 4.5),
                 ("accent/selection panel", t.accent, picked_panel, 4.5),
                 // The selected row of the panel when it has not the focus.
-                ("text/selection half", t.text, over(t.selection.opacity(0.5), t.panel), 4.5),
-                ("accent/selection half", t.accent, over(t.selection.opacity(0.5), t.panel), 4.5),
+                ("text/selection half", t.text, over(t.selection_idle(), t.panel), 4.5),
+                ("accent/selection half", t.accent, over(t.selection_idle(), t.panel), 4.5),
                 // Atelier: text on the ground, and the accent of an open pill (10 % over the ground or a sheet).
                 ("text/ground", t.text, t.ground, 4.5),
                 ("accent/ground", t.accent, t.ground, 4.5),
-                ("accent/pill", t.accent, over(t.accent.opacity(0.1), t.bg), 4.5),
+                ("accent/pill", t.accent, over(t.pill_tint(), t.bg), 4.5),
                 // The calendar's today: the digit (drawn in `bg`) on its `accent` circle.
                 ("bg/accent", t.bg, t.accent, 4.5),
-                ("accent/pill ground", t.accent, over(t.accent.opacity(0.1), t.ground), 4.5),
+                ("accent/pill ground", t.accent, over(t.pill_tint(), t.ground), 4.5),
                 ("string/bg", t.string, t.bg, 4.5),
                 ("string/code", t.string, t.code_bg, 4.5),
                 ("number/bg", t.number, t.bg, 4.5),
@@ -477,7 +542,7 @@ mod tests {
         let mut fails = Vec::new();
         for (name, _) in THEMES {
             let t = Theme::of(&Prefs::parse(&format!("theme={name}\n")), WindowAppearance::Light);
-            let (open, picked) = (over(crate::ui::widgets::pill_tint(t), t.bg), over(t.selection, t.bg));
+            let (open, picked) = (over(t.pill_tint(), t.bg), over(t.selection, t.bg));
             if contrast(open, t.bg) < 1.03 {
                 fails.push(format!("{name}: the open row does not show on the sheet ({:.3})", contrast(open, t.bg)));
             }
@@ -511,17 +576,43 @@ mod tests {
         assert!(fails.is_empty(), "{}", fails.join("\n"));
     }
 
-    /// Print the ground/sheet contrast of the 13 themes (`cargo test ground_table -- --nocapture --ignored`).
+    /// In each theme the sheet shows on the ground behind it, and text, secondary text and accent read on that ground.
     #[test]
-    #[ignore]
-    fn ground_table() {
+    fn the_ground_shows_the_sheet_and_carries_text() {
+        let mut fails = Vec::new();
         for (name, _) in THEMES {
             let t = Theme::of(&Prefs::parse(&format!("theme={name}\n")), WindowAppearance::Light);
-            let hex = |c: Hsla| {
-                let c = c.to_rgb();
-                format!("#{:02x}{:02x}{:02x}", (c.r * 255.).round() as u8, (c.g * 255.).round() as u8, (c.b * 255.).round() as u8)
-            };
-            println!("{name}: ground {} sheet {} ratio {:.3} text/ground {:.2} soft/ground {:.2} accent/ground {:.2}", hex(t.ground), hex(t.bg), contrast(t.ground, t.bg), contrast(t.text, t.ground), contrast(t.soft, t.ground), contrast(t.accent, t.ground));
+            let line = format!("{name}: ground {} sheet {}", hex(t.ground), hex(t.bg));
+            if contrast(t.ground, t.bg) < 1.03 {
+                fails.push(format!("{line}: the sheet does not show on the ground ({:.3})", contrast(t.ground, t.bg)));
+            }
+            for (what, fg) in [("text", t.text), ("soft", t.soft), ("accent", t.accent)] {
+                if contrast(fg, t.ground) < 4.5 {
+                    fails.push(format!("{line}: {what} {:.2} on the ground", contrast(fg, t.ground)));
+                }
+            }
+        }
+        assert!(fails.is_empty(), "{}", fails.join("\n"));
+    }
+
+    #[test]
+    fn hex_rounds_to_the_nearest_channel_on_edge_values() {
+        let h = |h, s, l| hex(Hsla { h, s, l, a: 1. });
+        assert_eq!(h(0., 0., 0.), "#000000");
+        assert_eq!(h(0., 0., 1.), "#ffffff");
+        assert_eq!(h(0.7, 0., 0.5), "#808080"); // 127.5 rounds up, not down to 7f
+        assert_eq!(h(0., 1., 0.5), "#ff0000");
+        assert_eq!(h(1., 1., 0.5), "#ff0000"); // hue 360 is hue 0
+        assert_eq!(h(1. / 3., 1., 0.5), "#00ff00");
+        assert_eq!(h(2. / 3., 1., 0.5), "#0000ff");
+        assert_eq!(h(0., 1., 0.25), "#800000");
+        assert_eq!(rgb8(Hsla { h: 0.3, s: 0.4, l: 0.5, a: 0.2 }), rgb8(Hsla { h: 0.3, s: 0.4, l: 0.5, a: 1. }));
+    }
+
+    #[test]
+    fn every_callout_type_has_a_hue_of_the_recipe() {
+        for label in ["[!note]", "[!TIP]", "[!success]", "[!important]", "[!warning]", "[!caution]", "[!danger]", "[!error]", "[!unknown]"] {
+            assert!(HUES.contains(&callout_hue(label)), "{label}");
         }
     }
 

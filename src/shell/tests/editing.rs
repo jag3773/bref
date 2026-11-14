@@ -1,13 +1,13 @@
 //! Editing journeys: `/` commands, block handles, inline formatting and its bar, templates.
 
+use crate::platform::config;
 use super::*;
 
 /// What can be done is found without knowing it: the command palette (F10, or ">"), which
 /// searches them by what they do, the view's first; help opened on the view; a table's bar.
 #[gpui::test]
 fn commands_are_found(cx: &mut TestAppContext) {
-    let root = std::env::temp_dir().join(format!("bref-commands-{}", std::process::id()));
-    fs::create_dir_all(&root).unwrap();
+    let root = TempDir::new("commands");
     fs::write(root.join("data.csv"), "nom;age\nAna;31\nBob;27\n").unwrap();
     let _config = isolated_config(&root);
     cx.update(bind_keys);
@@ -107,15 +107,13 @@ fn commands_are_found(cx: &mut TestAppContext) {
     let at = cx.debug_bounds("sheet-span-sheet::DeleteRows").expect("a whole row has its gestures").center();
     cx.simulate_click(at, gpui::Modifiers::none());
     assert_eq!(sheet.read_with(cx, |sheet, _| (sheet.table().rows(), sheet.table().cell(1, 0).to_string())), (2, "Bob".to_string()));
-    fs::remove_dir_all(&root).unwrap();
 }
 
 /// Block handles: hovering a line, dragging the handle moves its block,
 /// a click opens its menu, the "+" puts a block below with the `/` list; Alt+arrow moves it.
 #[gpui::test]
 fn block_handles(cx: &mut TestAppContext) {
-    let root = std::env::temp_dir().join(format!("bref-blocks-{}", std::process::id()));
-    fs::create_dir_all(&root).unwrap();
+    let root = TempDir::new("blocks");
     let _config = isolated_config(&root);
     cx.update(bind_keys);
     cx.update(init_fonts);
@@ -219,16 +217,13 @@ fn block_handles(cx: &mut TestAppContext) {
     cx.simulate_input("h1");
     cx.simulate_keystrokes("enter");
     assert!(text(cx).starts_with("# Titre\n\nUn\n\n# "), "{}", text(cx));
-    fs::remove_dir_all(&root).unwrap();
 }
 
 /// Templates end to end, and their limits: no folder, a name taken or unreadable, a template
 /// that is not one, a link that must not target a template, the daily note, undo.
 #[gpui::test]
 fn templates_journey(cx: &mut TestAppContext) {
-    let root = std::env::temp_dir().join(format!("bref-tpl-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+    let root = TempDir::new("tpl");
     fs::write(root.join("Courses.md"), "# Courses\n\n- lait #maison\n").unwrap();
     let _config = isolated_config(&root);
     cx.update(bind_keys);
@@ -364,16 +359,13 @@ fn templates_journey(cx: &mut TestAppContext) {
     assert_eq!(text(cx), format!("# {name}\n\n- [ ] "));
     cx.simulate_keystrokes("secondary-j");
     assert_eq!(text(cx), format!("# {name}\n\n- [ ] "));
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Text formatting: bold, italic, underline, strikethrough, highlight, code, by keyboard and by
 /// the bottom bar, with their limits (cursor alone, blanks, several lines, code, Backspace).
 #[gpui::test]
 fn formatting_journey(cx: &mut TestAppContext) {
-    let root = std::env::temp_dir().join(format!("bref-fmt-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+    let root = TempDir::new("fmt");
     fs::write(root.join("Note.md"), "x").unwrap();
     let _config = isolated_config(&root);
     cx.update(bind_keys);
@@ -747,7 +739,7 @@ fn formatting_journey(cx: &mut TestAppContext) {
     choose(cx, "down enter");
     assert!(shell.read_with(cx, |s, _| s.prefs.bar == "off" && !s.theme.bar));
     assert!(!shell.read_with(cx, |s, cx| s.pane().editor.read(cx).bar_shown()) && cx.debug_bounds("counts").is_some());
-    assert!(vault::load_settings().contains("bar=off\n"));
+    assert!(config::load(config::File::Settings).contains("bar=off\n"));
     // Escape during the list: the previewed choice is taken back.
     choose(cx, "up escape");
     assert!(shell.read_with(cx, |s, _| s.prefs.bar == "off"));
@@ -758,5 +750,23 @@ fn formatting_journey(cx: &mut TestAppContext) {
     }
     assert_eq!(Prefs::parse(&Prefs::parse("bar=off").to_text()).bar, "off");
     assert!(!Prefs::parse("").to_text().contains("bar="));
-    let _ = fs::remove_dir_all(&root);
+}
+
+/// A tool tab does not take a template into the note hidden under it.
+#[gpui::test]
+fn a_tool_tab_ignores_template_inserts(cx: &mut TestAppContext) {
+    let (root, shell, cx, _config) = start(cx, "tpl-tool");
+    fs::write(root.join("Carnet.md"), "# Carnet\n").unwrap();
+    fs::write(root.join("Modele.md"), "ajout").unwrap();
+    shell.update_in(cx, |s, window, cx| s.open(&root.join("Carnet.md"), window, cx));
+    cx.run_until_parked();
+    let text = |cx: &mut gpui::VisualTestContext| shell.read_with(cx, |s, cx| s.pane().editor.read(cx).text().to_string());
+    shell.update(cx, |s, cx| s.insert_template(&root.join("Modele.md"), cx));
+    assert!(text(cx).contains("ajout"), "a note takes the template");
+    let before = text(cx);
+    shell.update(cx, |s, _| s.pane_mut().set_tool(Mode::Graph));
+    shell.update(cx, |s, cx| s.insert_template(&root.join("Modele.md"), cx));
+    assert_eq!(text(cx), before, "a tool tab ignores it");
+    // Back to the note: the window saves its tabs when it goes, and must not hand a tool tab to the next test.
+    shell.update_in(cx, |s, window, cx| s.open(&root.join("Carnet.md"), window, cx));
 }

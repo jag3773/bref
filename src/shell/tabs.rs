@@ -24,7 +24,7 @@ impl Render for TabDragged {
             .max_w(t.px(220.))
             .truncate()
             .rounded(t.tab())
-            .text_size(t.px(13.))
+            .text_size(t.font_body())
             .text_color(t.text)
             .child(self.name.clone())
     }
@@ -34,18 +34,24 @@ impl Shell {
     /// What a tab is called: its file, its list page, or a new note's first line.
     pub(super) fn tab_name(&self, tab: usize, cx: &App) -> String {
         let pane = &self.panes[tab];
-        match pane.tool {
+        if pane.settings() {
+            return tr("Settings", "Réglages").to_string();
+        }
+        match pane.tool() {
             Some(Mode::Graph) => return tr("Graph", "Graphe").to_string(),
             Some(_) => return tr("Calendar", "Calendrier").to_string(),
             None => {}
         }
-        if let Some(listing) = &pane.listing {
-            return match nav::tag_of(&listing.of) {
+        if pane.health().is_some() {
+            return super::health::title().to_string();
+        }
+        if let Some(listing) = pane.listing() {
+            return match nav::tag_of(listing.of()) {
                 Some(tag) => format!("#{tag}"),
-                None => vault::stem(&listing.of),
+                None => vault::stem(listing.of()),
             };
         }
-        if let Some(path) = pane.file_path().or(pane.path.as_ref()) {
+        if let Some(path) = pane.displayed_path() {
             return vault::stem(path);
         }
         let first = pane.editor.read(cx).text().lines().next().unwrap_or_default().trim_start_matches('#').trim();
@@ -64,7 +70,7 @@ impl Shell {
             .map(|(&tab, name)| {
                 let pane = &self.panes[tab];
                 let twin = names.iter().filter(|other| *other == name).count() > 1;
-                let folder = pane.file_path().or(pane.path.as_ref()).and_then(|p| p.parent()).and_then(|p| p.file_name());
+                let folder = pane.displayed_path().and_then(|p| p.parent()).and_then(|p| p.file_name());
                 match folder.filter(|_| twin) {
                     Some(folder) => format!("{name} · {}", folder.to_string_lossy()),
                     None => name.clone(),
@@ -232,7 +238,7 @@ impl Shell {
                 .w_full()
                 .h(t.px(TAB_BAR))
                 .flex()
-                .text_size(t.px(13.))
+                .text_size(t.font_body())
                 .when(corner, |d| d.pr(t.px(render::PILL_ROOM)))
                 // Past the last tab, it lands at the end; out of the bar, nowhere in it.
                 .on_drag_move(cx.listener(move |this, e: &gpui::DragMoveEvent<TabDragged>, _, cx| {

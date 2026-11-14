@@ -19,7 +19,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use super::vault::{Signal, config_dir};
+use super::{config::{self, File}, signal::Signal};
 
 /// The answer to an agent: a sentence when the window could not show the file.
 pub type Answer = Result<(), String>;
@@ -34,7 +34,7 @@ pub struct Asked {
 pub const NOT_OPEN: &str = "Bref is not open: start it to see the file";
 
 fn door() -> PathBuf {
-    config_dir().join("bref/agent")
+    config::path(File::Agent)
 }
 
 /// Opens the door: each request lands in `asked`, and `signal` is raised for it.
@@ -55,7 +55,9 @@ fn open_at(file: &Path, asked: Arc<Mutex<Vec<Asked>>>, signal: Arc<Signal>) -> i
     writeln!(options.open(file)?, "{} {secret}", listener.local_addr()?.port())?;
     thread::Builder::new().name("agent door".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
-            let _ = serve(stream, &secret, &asked, &signal);
+            if let Err(e) = serve(stream, &secret, &asked, &signal) {
+                eprintln!("bref: agent door: {e}");
+            }
         }
     })?;
     Ok(())
@@ -74,7 +76,7 @@ fn serve(mut stream: TcpStream, secret: &str, asked: &Mutex<Vec<Asked>>, signal:
         Err(e) => Err(e),
         Ok(path) => {
             let (answer, wait) = mpsc::channel();
-            asked.lock().unwrap().push(Asked { path, answer });
+            asked.lock().unwrap_or_else(|e| e.into_inner()).push(Asked { path, answer });
             signal.raise();
             wait.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| Err("Bref did not answer".into()))
         }
@@ -131,7 +133,7 @@ mod tests {
         thread::spawn(move || {
             loop {
                 if signal.take() {
-                    for ask in asked.lock().unwrap().drain(..) {
+                    for ask in asked.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
                         let _ = ask.answer.send(answer(&ask.path));
                     }
                 }

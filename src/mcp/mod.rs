@@ -21,7 +21,6 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::platform::vault as files;
 
 const PARSE: i32 = -32700;
 const INVALID: i32 = -32600;
@@ -95,33 +94,19 @@ pub(super) fn arg_usize(args: &Value, key: &str) -> Option<usize> {
     args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
 
-/// Why a disk operation failed, in the words the app already uses, in English.
+/// Why a disk operation failed: the app's own words (the server speaks English, `lang::speak_english`).
 pub(super) fn disk(error: io::Error) -> String {
-    use io::ErrorKind::*;
-    match error.kind() {
-        PermissionDenied => "permission denied",
-        NotFound => "not found",
-        AlreadyExists => "this name is already taken",
-        ReadOnlyFilesystem => "the disk is read-only",
-        StorageFull => "the disk is full",
-        InvalidFilename => "invalid name",
-        NotADirectory => "not a folder",
-        IsADirectory => "this is a folder",
-        DirectoryNotEmpty => "the folder is not empty",
-        _ => return error.to_string(),
-    }
-    .into()
+    crate::lang::io_reason(&error)
 }
 
 /// Runs the server on the process's standard streams. `0` when the client closes stdin.
-pub fn run() -> i32 {
-    crate::lang::speak_english();
+pub fn run(args: &[String]) -> i32 {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         eprintln!("bref mcp: {info}");
         previous(info);
     }));
-    let (root, read_only) = match arguments() {
+    let (root, read_only) = match arguments(args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("bref mcp: {message}");
@@ -135,8 +120,8 @@ pub fn run() -> i32 {
     serve(&mut Server::open(root, read_only), stdin.lock(), stdout.lock())
 }
 
-fn arguments() -> Result<(Option<PathBuf>, bool), String> {
-    let mut args = std::env::args().skip(2);
+fn arguments(args: &[String]) -> Result<(Option<PathBuf>, bool), String> {
+    let mut args = args.iter().cloned();
     let mut root = None;
     let mut read_only = false;
     while let Some(arg) = args.next() {
@@ -162,7 +147,7 @@ impl Server {
                 Ok(vault) => (Some(vault), String::new()),
                 Err(message) => (None, message),
             },
-            None => match files::load_config().0 {
+            None => match crate::platform::config::load_config().0 {
                 None => (None, "no vault: open one in Bref, or pass `--vault`".into()),
                 Some(path) if !path.is_dir() => (None, format!("the vault in the config no longer exists (`{}`); pass `--vault`", path.display())),
                 Some(path) => match vault::Vault::open(path) {
@@ -286,12 +271,13 @@ impl Server {
     }
 
     fn need(&mut self) -> Result<&mut vault::Vault, Outcome> {
-        if self.vault.is_none() {
-            return Err(Outcome::err(self.blind.clone()));
+        match self.vault.as_mut() {
+            Some(vault) => {
+                vault.refresh();
+                Ok(vault)
+            }
+            None => Err(Outcome::err(self.blind.clone())),
         }
-        let vault = self.vault.as_mut().unwrap();
-        vault.refresh();
-        Ok(vault)
     }
 }
 

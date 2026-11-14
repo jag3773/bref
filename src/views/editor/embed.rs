@@ -46,8 +46,6 @@ type Read = (Instant, Option<(SystemTime, u64)>, Rc<str>);
 /// The notes an editor can show in embeds, and what it keeps of them.
 #[derive(Default)]
 pub(super) struct Embeds {
-    /// Name of each note (lowercase, aliases too) → its file.
-    pub(super) sources: Rc<HashMap<String, PathBuf>>,
     /// The note shown, and the embeds above it when this editor is itself an embed: a note
     /// already in the chain would loop.
     pub(super) trail: Vec<String>,
@@ -110,13 +108,13 @@ impl Embeds {
     }
 
     /// The file `name` stands for, in the vault.
-    fn path_of(&self, name: &str) -> Option<PathBuf> {
-        self.sources.get(&name.to_lowercase()).cloned()
+    fn path_of(host: &Editor, name: &str) -> Option<PathBuf> {
+        host.vault.sources.get(&name.to_lowercase()).cloned()
     }
 
     /// The text of what the embed points at, or why there is none.
-    fn section(&mut self, target: &Target) -> Result<(PathBuf, Rc<str>), String> {
-        let path = self.path_of(&target.note).ok_or_else(|| tr("note not found", "note introuvable").to_string())?;
+    fn section(&mut self, target: &Target, host: &Editor) -> Result<(PathBuf, Rc<str>), String> {
+        let path = Self::path_of(host, &target.note).ok_or_else(|| tr("note not found", "note introuvable").to_string())?;
         let text = self.text(&path).ok_or_else(|| tr("note not found", "note introuvable").to_string())?;
         let shown = embed::section(&text, &target.anchor).ok_or_else(|| match &target.anchor {
             Anchor::Block(_) => tr("block not found", "bloc introuvable").to_string(),
@@ -135,7 +133,7 @@ impl Embeds {
         if self.trail.len() > DEPTH {
             return message(tr("embedded too deep", "incorporation trop profonde").to_string());
         }
-        let (path, text) = match self.section(target) {
+        let (path, text) = match self.section(target, host) {
             Ok(found) => found,
             Err(why) => return message(why),
         };
@@ -143,23 +141,23 @@ impl Embeds {
         let slot = match self.slots.remove(&key) {
             Some(slot) => slot,
             None => {
-                let (theme, trail, sources) = (host.theme, self.trail.iter().cloned().chain([name]).collect::<Vec<_>>(), self.sources.clone());
+                let (theme, trail, vault) = (host.theme, self.trail.iter().cloned().chain([name]).collect::<Vec<_>>(), host.vault.clone());
                 let child = cx.new(|cx| {
                     let mut child = Editor::new(theme, cx);
                     child.readonly = true;
                     child.embeds.trail = trail;
-                    child.embeds.sources = sources;
+                    child.vault = vault;
                     child
                 });
                 Slot { child, text: "".into(), seen: 0 }
             }
         };
-        let (dirs, images, theme) = (vec![path.parent().map(Path::to_path_buf), host.dirs.last().cloned()].into_iter().flatten().collect::<Vec<_>>(), host.images.clone(), host.theme);
+        let (dirs, vault, theme) = (vec![path.parent().map(Path::to_path_buf), host.dirs.last().cloned()].into_iter().flatten().collect::<Vec<_>>(), host.vault.clone(), host.theme);
         let mut slot = slot;
         let inner = slot.child.update(cx, |child, cx| {
-            if slot.text != text || child.dirs != dirs || child.images != images || child.theme != theme {
+            if slot.text != text || child.dirs != dirs || !Rc::ptr_eq(&child.vault, &vault) || child.theme != theme {
                 child.theme = theme;
-                child.images = images;
+                child.vault = vault;
                 child.dirs = dirs;
                 child.load(text.to_string(), 0, cx);
                 slot.text = text.clone();
@@ -190,16 +188,6 @@ impl Embeds {
 }
 
 impl Editor {
-    /// Tells the editor the notes it can show in embeds (name in lowercase, aliases too → file) and
-    /// the name of the one it shows, which an embed may not lead back to.
-    pub fn set_sources(&mut self, sources: Rc<HashMap<String, PathBuf>>, me: Option<String>) {
-        self.embeds.sources = sources;
-        self.embeds.trail = me.into_iter().map(|m| m.to_lowercase()).collect();
-        self.embeds.recheck = true;
-        self.epoch += 1;
-        self.laid_out = None;
-    }
-
     /// The name of the note shown changed: an embed may not lead back to it.
     pub fn set_trail(&mut self, me: Option<String>) {
         self.embeds.trail = me.into_iter().map(|m| m.to_lowercase()).collect();
@@ -239,12 +227,12 @@ impl Editor {
         window.paint_quad(fill(Bounds::new(area.origin, size(BAR, area.size.height)), t.accent));
         // The source's name, on the right of the strip; a click on it opens the note there.
         let label = embed.target.label();
-        let run = |color| TextRun { len: label.len(), font: font(sans()), color, background_color: None, underline: None, strikethrough: None };
+        let run = |color| TextRun { len: label.len(), font: font(t.sans), color, background_color: None, underline: None, strikethrough: None };
         let hot = self.embed_label(row, embed).is_some_and(|b| b.contains(&self.pointer));
         let text = window.text_system().shape_line(SharedString::from(label.clone()), px(12.), &[run(if hot { t.accent } else { t.soft })], None);
         text.paint(point(area.right() - PAD - text.width, area.top() + px(4.)), px(16.), window, cx).ok();
         if let Some(why) = &embed.message {
-            let run = TextRun { len: why.len(), font: font(sans()), color: t.soft, background_color: None, underline: None, strikethrough: None };
+            let run = TextRun { len: why.len(), font: font(t.sans), color: t.soft, background_color: None, underline: None, strikethrough: None };
             let line = window.text_system().shape_line(SharedString::from(why.clone()), px(13.), &[run], None);
             line.paint(point(area.left() + BAR + PAD, area.top() + px(3.)), px(18.), window, cx).ok();
             return;

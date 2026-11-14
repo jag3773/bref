@@ -7,7 +7,7 @@ map: where things live, which way the dependencies go, and the rules the code ke
 
 ```
 src/
-  main.rs      entry point: declares the layers, sends `bref mcp` to mcp::run(), then shell::run()
+  main.rs      entry point: declares the layers, sends `bref mcp` to mcp::run(&args), then shell::run()
   lang.rs      tr("English", "Français"), language detection, date and search-key names
   actions.rs   the app's actions, dispatched by shortcuts, menus and the palette
   logic/       pure functions: no gpui, no disk, no window
@@ -43,20 +43,22 @@ each, all `impl Shell`:
 
 | File | Subject |
 |---|---|
-| `pane.rs` | the panes and their tabs, which one is active, the file a tab shows (`FileView`), splitting, moving a tab between panes, the saved layout; the panes are placed by the tree `logic/layout.rs` (`Node`, leaves = groups), drawn by `render_layout` |
+| `pane.rs` | the panes and their tabs, which one is active, the file a tab shows (`FileView`), splitting, moving a tab between panes, the saved layout; the panes are placed by the tree `logic/layout.rs` (`Node`, leaves = groups; `read_panes` reads the saved file), drawn by `render_layout` |
 | `tabs.rs` | the tab bar of a pane |
 | `notes.rs` | opening, previewing, creating, saving notes; links and wikilinks |
 | `library.rs` | the vault: choosing, scanning, watching, icons, backup, trash |
 | `sync.rs` | git sync and cloning |
 | `sidebar.rs`, `files.rs`, `menu.rs`, `listing.rs` | the side panel, file operations, the context menu, list pages |
-| `docks.rs` | where each view of the panel lives: the left dock, the right dock, or a tab (`Pane::tool`). Each dock stacks its shown views (`Nav::left_shown`, `Nav::right_shown`, `Nav::folded`); each view has its own rows and scroll: the active one is in `Nav`, the others wait in `Nav::parked`, and drawing a section, its rows, or a press in it swaps its view in (`Nav::activate`). A header dragged (`ToolDragged`) lands with `place_tool` |
+| `docks.rs` | the shell side of the panel's tools: where each view lives is `Nav`'s (`dock_tools`, `put_tool`, `stack_tool`, `hide_tool`, `place_tool`, `toggle_fold`, which take the tools open as tabs, `Shown::Tool`); this file gathers those tabs (`Pane::tool`), moves focus and refreshes after each, and holds `ToolDragged`. Each dock stacks its shown views (`Nav::left_shown`, `Nav::right_shown`, `Nav::folded`); each view has its own rows and scroll: the active one is in `Nav`, the others wait in `Nav::parked` (`Nav::activate`) |
 | `palette_open.rs` | every way the palette opens: notes, commands, outline, questions |
-| `help.rs`, `keymap.rs` | the help panel; the default shortcuts and their sections |
+| `help.rs`, `keymap.rs` | the help panel; `keymap.rs`: the help's layout (sections, text rows) and the installation of the shortcuts; `command_table.rs`: the command table, one `CommandSpec` per action (typed: label, icon, group, help line, editable flag, default keys, and what the window does on the action), from which the palette's commands, `defaults`, the help's lines, the context menu's labels and the window's action handlers derive |
 | `travel.rs` | back and forward |
 | `search.rs`, `templates.rs`, `tables.rs`, `diagrams.rs`, `board.rs`, `drops.rs`, `capture.rs`, `print.rs` | one feature each |
+| `health.rs` | the vault health page (`Cover::Health`), shown in place of the note like a list page, opened by `VaultHealth` in the command table; scans off the UI thread with `logic/health.rs`, only while shown |
 | `sharing.rs` | the document-aware Share / Export menu, clipboard formats and save-copy dialog; pure text conversion in `logic/sharing.rs`, atomic no-replace copies in `platform/export.rs` |
-| `settings.rs`, `toasts.rs`, `updates.rs` | settings, status messages, new versions |
-| `render.rs` | drawing the window |
+| `settings.rs`, `toasts.rs`, `updates.rs` | settings (the palette's choice lists, restyling), status messages, new versions |
+| `settings_page.rs` | the settings tab (`Shown::Settings`, one at most, saved as `@settings`): its sections and rows (`Section`, `Row`), keys, search, and the agents' configuration to copy |
+| `render.rs` | drawing the window (a pure function of the state), and `sync_after_change`: what follows from a change (active pane, history, title, comments, window frame, docks) is settled there, from the shell's own `notify`, the panes' focus events and the window's bounds, never while drawing |
 
 A `Pane` is what **one tab** holds (a note, or a file in its place); `Shell::panes` lists every
 tab of the window, shown or not, so what must reach every open note (saving, renames, the watcher,
@@ -66,6 +68,8 @@ What the user opens goes through `Shell::open`: the tab that already shows the f
 new tab (a preview or an empty tab is used in place); `open_note` loads into the active tab and
 is for code that has already chosen it (restoring, the history).
 The active tab is `self.pane()` / `self.pane_mut()`; `each_pane` and `in_pane` reach the others.
+`Pane::shows_note` is the one test for "the note's own text is shown" (no file, no list page in its place).
+`Pane::shown` is one `Shown`: a page (`Base`: the note or a `FileView` in its place, plus an optional `Cover`: a list page or a figure, one at a time, over either) or a `Tool`, which shows nothing else, or the `Settings` page. Read it with `file()`, `listing()`, `figure()`, `tool()`, `page()`, `settings()`.
 `Pane::displayed_path` identifies its current document, preferring `FileView` over the note kept
 underneath. The tree and graph use it; `Pane::path` stays the note's identity for editing and saving,
 and backlinks keep their own note anchor, separate from the displayed file and tree selection.
@@ -75,12 +79,25 @@ A view talks to the shell only through its events (`EditorEvent`, `SheetEvent`, 
 
 | To change… | Go to |
 |---|---|
-| how Markdown is read (headings, links, tags, styles) | `logic/markdown/` (`mod.rs`; `tables.rs`, `lists.rs`, `front.rs`, `dates.rs`, `search.rs`) |
+| how Markdown is read (headings, links, tags, styles) | `logic/markdown/` (`mod.rs`; `tables.rs` with the comment `Scope`, `lists.rs`, `front.rs`; `walk.rs`: the one walk over the lines outside code blocks, a stray ``` opens nothing; `wiki.rs`: `WikiLink` reads `target#anchor|alias`, `rewrite_wikilinks` is the one rewriter) |
+| dates (day numbers, calendar months, the dates offered after `@`), find and replace, word counts | `logic/dates.rs`, `logic/search.rs` |
 | CSV/TSV parsing and writing | `logic/table.rs` |
+| zooming around a point, with each surface's limits (viewer, canvas, graph) | `logic/zoom.rs` (`zoom_at`, `wheel`, `Limits`) |
+| undo and redo of the canvas and the grid (two capped stacks) | `logic/undo.rs` (`History`); the text editor keeps its own compressed stack (`Snapshots` in `views/editor/edit.rs`) with the same depth |
+| the system's text input (IME composition) into a `Line` | `ui/line.rs` (`LineInput`, `line_input!`): the palette and the grid cell; `views/field.rs` has its own handler (it places the candidate window) |
+| kanban boards read from a note (columns, cards, moves) | `logic/kanban.rs`; the pane's state and card widgets in `views/kanban.rs`, drawn by `shell/board.rs` |
+| graph maths (edges, force layout, node sizes, drag propagation) | `logic/graph.rs`; drawn by `views/graph.rs` |
+| rows of the folder tree and the tags (`Row`, `tree_rows`, `tag_rows`) | `logic/tree.rs`; panel state in `views/nav.rs` (private fields, changed through `Nav` methods), drawn by `shell/sidebar.rs` |
+| the panel's tools (`Mode`, `Panel`) and the `layout` file line (`parse`, `write`) | `logic/dock.rs`; the panel state in `views/nav.rs` |
+| names and kinds of files from the path alone (`natural` sort key, `is_image`, `is_table`, `is_attachment`) | `logic/files.rs`, re-exported by `platform/vault.rs` |
+| fitting a name and its detail in a panel row (`share`, `ellipsize`, `split_ext`) | `logic/rows.rs`; measured and drawn by `shell/sidebar.rs` |
 | embedded sections (`![[Note#Heading]]`: reading the line, finding the section, rewriting links to a renamed heading) | `logic/embed.rs`; laid out and drawn by `views/editor/embed.rs` (a read-only `Editor` per section, framed under its line) |
 | formulas of the cells of a table (parser, evaluator, numbers as written) | `logic/formula.rs`; shown by `views/editor/grid.rs` (`results`, `Shown`), written and completed by `views/editor/formulas.rs` |
-| diagrams (shapes, arrows, SVG with its source) and their import | `logic/diagram/` (`file.rs`: the SVG and its source; `hold.rs`: what a package or a frame holds; `pick.rs`: what a click grabs); Mermaid class, sequence and state diagrams turned into canvas diagrams (`logic/mermaid.rs`); relationships (`logic/relation.rs`), class notation (`logic/uml.rs`), `logic/import.rs`; styled text of their labels: `logic/richtext.rs` (the marks of `markdown::emphasis`); the editor: `views/canvas/` |
-| the vault on disk (scan, save, rename, trash, config files) | `platform/vault.rs` |
+| diagrams (shapes, arrows, SVG with its source) and their import | `logic/diagram/` (`scene.rs`: the primitives of a drawing, painted by both the SVG file and the canvas; `file.rs`: the SVG and its source; `hold.rs`: what a package or a frame holds; `pick.rs`: what a click grabs); Mermaid class, sequence and state diagrams turned into canvas diagrams (`logic/mermaid.rs`); relationships (`logic/relation.rs`), class notation (`logic/uml.rs`), `logic/import.rs`; styled text of their labels: `logic/richtext.rs` (the marks of `markdown::emphasis`); the editor: `views/canvas/` |
+| the vault on disk (scan, save, rename, trash) | `platform/vault.rs` |
+| the app's config files (`File`, one `config_dir`, old-name fallback) | `platform/config.rs` |
+| wake-up signal of the watcher and the door | `platform/signal.rs` |
+| system terminal, capture shortcut (GNOME), vault backup (tar.gz) | `platform/terminal.rs`, `platform/shortcut.rs`, `platform/backup.rs` |
 | git commands, update check | `platform/git.rs`, `platform/update.rs` |
 | a note saved as PDF | `ui/print.rs` (A4 pages as SVG, text kept as `<text>`, pure), `platform/pdf.rs` (svg2pdf, links), `Shell::export_pdf` in `shell/print.rs` (dialog, pictures and embeds read, free name) |
 | the window's door for `bref mcp` (`show`) | `platform/link.rs` (127.0.0.1 and a secret in `<config>/bref/agent`), `Shell::listen` in `shell/library.rs` |
@@ -91,8 +108,9 @@ A view talks to the shell only through its events (`EditorEvent`, `SheetEvent`, 
 | what a keystroke costs | `views/editor/layout.rs` (`plan` redoes only the damaged lines) then `paint.rs`; the test `layout_reuse_matches_full_layout` checks every reuse against a full layout |
 | the tree, recent notes, calendar | `views/nav.rs` (state), `shell/sidebar.rs` (drawing) |
 | the command palette | `views/palette.rs`, `shell/palette_open.rs` |
+| what the vault health page finds (broken links, orphans, conflict copies…) and its fixes | `logic/health.rs` (pure, unit-tested); the page: `shell/health.rs` |
 | the CSV/TSV grid | `views/sheet/` (`disk.rs` loading and saving, `edit.rs`, `clipboard.rs`, `mouse.rs`, `render.rs`) |
-| a shortcut | `shell/keymap.rs` (`defaults`, `help_sections`), `ui/keys.rs` (how keys are read and shown) |
+| a shortcut | `shell/command_table.rs` (one `CommandSpec`: action, label, icon, group, help, editable, keys, handler), `shell/keymap.rs` (`help_sections` layout), `ui/keys.rs` (how keys are read and shown; `keys::context`: the key-context names) |
 | the test of a feature | `shell/tests/` (`end_to_end/` is one session, one file per chapter) |
 | the user guide | `book/src/` (an mdBook); `shortcuts.md` is written from `help_sections` by the test `shortcuts_page_is_current` |
 | the MCP server (`bref mcp`) | `src/mcp/` (`mod.rs` the protocol, `notes.rs`, `draw.rs`, `guide.rs`); `main` routes `mcp` before the window. A session over pipes is `tests/mcp.rs` |
@@ -118,15 +136,15 @@ A view talks to the shell only through its events (`EditorEvent`, `SheetEvent`, 
   mechanism when watching is not possible.
 - **Palette**: name matches first (substring, ranked by position, then subsequence; ties keep the
   most recently opened note first), then notes whose text contains every word, most recent first.
-  The whole text of the vault is kept in memory for that, as written and in lower case: it is
-  lowered once, when the vault is read, not each time the palette opens.
+  The whole text of the vault is kept in memory for that, once, as written: each word typed is
+  searched whatever its case (`rank::Words`), so no lowercase copy of the notes is kept.
 - **Navigation** (`views/nav.rs`, `shell/sidebar.rs`): the tree is rebuilt from the paths of the
   indexed notes, and only the visible rows are drawn.
-- **Graph** (`views/graph.rs`): a force-directed layout computed off the UI thread when the links
+- **Graph** (`logic/graph.rs`, `views/graph.rs`): a force-directed layout computed off the UI thread when the links
   change, then drawn as plain lines and discs. Links to notes that do not exist yet are left out.
 - **Diagrams** (`logic/diagram/`, `views/canvas/`, `logic/import.rs`): shapes and arrows are plain
-  data; the same outlines are drawn on the canvas and written to the SVG file, whose `<metadata>`
-  holds one line of source per element.
+  data; `Diagram::scene` lists what is drawn (paths with ink, dash and fill; text lines) and both the canvas and the SVG file paint that list; the file's `<metadata>`
+  holds one line of source per element (escaped by `logic/xml.rs`).
 - **Figures and SVG** (`ui/svg.rs`, `views/viewer.rs`): Mermaid diagrams and SVG files are laid out
   and rasterized off the UI thread, at most one at a time per figure, and the previous version stays
   on screen until the new one is ready; a figure never exceeds 8,192 pixels a side or 16 million
@@ -138,7 +156,7 @@ A view talks to the shell only through its events (`EditorEvent`, `SheetEvent`, 
   real macOS by CI. `BREF_RELEASES_API` points the check at a local `file://` release description,
   to try an update without publishing one.
 - **Startup**: the last note is read before the first frame, so the window appears with its content.
-  Icons are embedded in the binary. `bref mcp` never reaches that: `main` runs `mcp::run()` and
+  Icons are embedded in the binary. `bref mcp` never reaches that: `main` runs `mcp::run(&args)` and
   leaves before the window, one JSON-RPC message at a time, stdout reserved for the protocol.
 - **Agents**: the server keeps the vault's index and rereads it when the watcher signals a change.
   It writes with the same rules as the app (atomic save, trash, a taken name refused, links

@@ -2,136 +2,38 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    fs,
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use super::signal::Signal;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::{logic::markdown, lang::tr};
-use crate::logic::note::{Note, lowered};
-
-/// The user's configuration folder, per platform.
-pub fn config_dir() -> PathBuf {
-    let var = |key: &str| env::var_os(key).map(PathBuf::from);
-    let dir = if cfg!(windows) {
-        var("APPDATA")
-    } else if cfg!(target_os = "macos") {
-        var("HOME").map(|home| home.join("Library/Application Support"))
-    } else {
-        var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|home| home.join(".config")))
-    };
-    dir.unwrap_or_default()
-}
-
-fn config_path() -> PathBuf {
-    config_dir().join("bref/config")
-}
-
-/// (vault, open notes from most recent to oldest): one line each.
-pub fn load_config() -> (Option<PathBuf>, Vec<PathBuf>) {
-    // Falls back to the config of the app's old name; it is never rewritten.
-    let text = fs::read_to_string(config_path())
-        .or_else(|_| fs::read_to_string(config_dir().join("encre/config")))
-        .unwrap_or_default();
-    let mut lines = text.lines().filter(|l| !l.is_empty()).map(PathBuf::from);
-    (lines.next(), lines.collect())
-}
-
-pub fn save_config(vault: &Path, recent: &[PathBuf]) {
-    let path = config_path();
-    let text: String = std::iter::once(vault)
-        .chain(recent.iter().map(PathBuf::as_path))
-        .map(|p| format!("{}\n", p.display()))
-        .collect();
-    let result = path
-        .parent()
-        .map_or(Ok(()), fs::create_dir_all)
-        .and_then(|_| fs::write(&path, text));
-    if let Err(e) = result {
-        eprintln!("bref: {} ({}): {e}", tr("config not saved", "config non enregistrée"), path.display());
-    }
-}
-
-pub fn load_file(name: &str) -> String {
-    // Same fallback as for the config: settings left under the old name are read again.
-    fs::read_to_string(config_dir().join("bref").join(name))
-        .or_else(|_| fs::read_to_string(config_dir().join("encre").join(name)))
-        .unwrap_or_default()
-}
-
-pub fn save_file(name: &str, text: &str) {
-    let path = config_dir().join("bref").join(name);
-    // Mere convenience: if writing fails, the app will reopen with its original settings.
-    let _ = path.parent().map_or(Ok(()), fs::create_dir_all).and_then(|_| fs::write(path, text));
-}
-
-/// Layout of the navigation panel, kept as is on one line.
-pub fn load_layout() -> String {
-    load_file("layout")
-}
-
-pub fn save_layout(text: &str) {
-    save_file("layout", text)
-}
-
-/// Chosen appearance (theme, fonts, size): one `key=value` line per setting.
-pub fn load_settings() -> String {
-    load_file("settings")
-}
-
-pub fn save_settings(text: &str) {
-    save_file("settings", text)
-}
+use crate::logic::note::Note;
 
 /// Folder offered for a first vault: `Notes` in the user's Documents, or
 /// in their home folder if they have no Documents.
 pub fn default_vault() -> Option<PathBuf> {
-    let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)?;
+    let home = super::config::home()?;
     let documents = home.join("Documents");
     Some(if documents.is_dir() { documents } else { home }.join("Notes"))
 }
 
 /// A path as shown: the home folder shortened to `~` outside Windows.
 pub fn shown(path: &Path) -> String {
-    let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let home = super::config::home();
     match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if !cfg!(windows) => format!("~/{}", rest.display()),
         _ => path.display().to_string(),
     }
 }
 
-/// Piece of a name for natural sort: a number compares by its value, before text.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub enum Chunk {
-    Number(u128),
-    Text(String),
-}
-
-/// "Natural" sort key, like file managers use: `Note 2` before
-/// `Note 10`, ignoring case.
-pub fn natural(name: &str) -> Vec<Chunk> {
-    let mut chunks = Vec::new();
-    let mut rest = name;
-    while let Some(first) = rest.chars().next() {
-        let digit = first.is_ascii_digit();
-        let end = rest.find(|c: char| c.is_ascii_digit() != digit).unwrap_or(rest.len());
-        let (part, tail) = rest.split_at(end);
-        chunks.push(match part.parse() {
-            Ok(n) if digit => Chunk::Number(n),
-            _ => Chunk::Text(part.to_lowercase()),
-        });
-        rest = tail;
-    }
-    chunks
-}
+pub use crate::logic::files::*;
 
 pub fn stem(path: &Path) -> String {
     path.file_stem()
@@ -162,38 +64,18 @@ pub fn in_templates(root: &Path, path: &Path) -> bool {
     parts.next_back().is_some() && parts.next().is_some_and(|first| is_template_dir(&first.as_os_str().to_string_lossy()))
 }
 
-/// The file is an image the app can display.
-pub fn is_image(path: &Path) -> bool {
-    let known = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "avif"];
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| known.iter().any(|k| e.eq_ignore_ascii_case(k)))
+/// The daily note template among the templates: the one called `Daily`, `Journal`, `Today`, `Note du jour`…
+pub fn daily_template(templates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let named: Vec<(PathBuf, String)> = templates.into_iter().map(|path| {
+        let name = stem(&path);
+        (path, name)
+    }).collect();
+    crate::logic::daily::pick(named.iter().map(|(path, name)| (path.clone(), name.as_str())))
 }
 
-/// Files kept in the vault without being read: they are listed in the tree, found in
-/// the palette, targeted by `[[name.pdf]]` and opened in the system's application.
-const ATTACHMENTS: [&str; 34] = [
-    "pdf", "mp4", "m4v", "mov", "mkv", "webm", "avi", "mp3", "m4a", "wav", "ogg", "opus", "flac", "zip", "7z", "tar", "gz", "rar",
-    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "epub", "txt", "json", "xml", "html", "rtf", "log",
-];
-
-pub fn is_attachment(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| ATTACHMENTS.iter().any(|k| e.eq_ignore_ascii_case(k)))
-}
-
-/// The file is an image, a table or an attachment: what the tree shows besides notes.
-pub fn is_file_shown(path: &Path) -> bool {
-    is_image(path) || is_table(path) || is_attachment(path)
-}
-
-/// The file is a table (CSV or TSV) the app opens in a grid.
-pub fn is_table(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| ["csv", "tsv"].iter().any(|k| e.eq_ignore_ascii_case(k)))
-}
-
-/// The images among the vault's files (the graph and `![[…]]` links ignore tables).
-pub fn pictures(files: &[PathBuf]) -> Vec<PathBuf> {
-    files.iter().filter(|p| is_image(p)).cloned().collect()
+/// Path of `path` relative to the vault, with `/` even on Windows.
+pub fn rel(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
 /// True the first time this folder is entered. A symbolic link that points back up to a
@@ -208,7 +90,7 @@ fn is_dir(entry: &fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|kind| kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
 }
 
-/// Fingerprint of the vault's state: the paths of its notes, images and folders,
+/// Fingerprint of the vault's state: the paths of its notes, the other files it shows and its folders,
 /// and the date of each file. It changes as soon as another program touches it, without
 /// reading a single file.
 pub fn fingerprint(root: &Path) -> u64 {
@@ -229,8 +111,8 @@ pub fn fingerprint(root: &Path) -> u64 {
                 }
             } else if path.extension().is_some_and(|e| e == "md") {
                 seen.push((path, entry.metadata().and_then(|m| m.modified()).ok()));
-            } else if is_image(&path) || is_table(&path) {
-                // Another program rewriting the open table or diagram must be seen.
+            } else if is_file_shown(&path) {
+                // Another program adding an attachment, or rewriting the open table or diagram, must be seen.
                 seen.push((path, entry.metadata().and_then(|m| m.modified()).ok()));
             }
         }
@@ -250,44 +132,6 @@ fn matters(root: &Path, event: &Event) -> bool {
             .is_ok_and(|rel| rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
     };
     !event.kind.is_access() && (event.paths.is_empty() || !event.paths.iter().all(hidden))
-}
-
-/// A signal that wakes the task waiting on it, without it having to poll: the system's
-/// thread raises it, the task sleeps until then.
-#[derive(Default)]
-pub struct Signal {
-    raised: AtomicBool,
-    waker: std::sync::Mutex<Option<std::task::Waker>>,
-}
-
-impl Signal {
-    pub fn raise(&self) {
-        self.raised.store(true, Ordering::Release);
-        if let Some(waker) = self.waker.lock().unwrap().take() {
-            waker.wake();
-        }
-    }
-
-    /// True, and the signal drops, if it was raised since the last call.
-    pub fn take(&self) -> bool {
-        self.raised.swap(false, Ordering::AcqRel)
-    }
-
-    /// Waits until the signal is raised (true) or `deadline` passes (false).
-    pub async fn wait<D: std::future::Future<Output = ()> + Unpin>(&self, mut deadline: D) -> bool {
-        std::future::poll_fn(|cx| {
-            if self.take() {
-                return std::task::Poll::Ready(true);
-            }
-            *self.waker.lock().unwrap() = Some(cx.waker().clone());
-            // Raised in the meantime, before the waker is in place: it is not missed.
-            if self.take() {
-                return std::task::Poll::Ready(true);
-            }
-            std::pin::Pin::new(&mut deadline).poll(cx).map(|()| false)
-        })
-        .await
-    }
 }
 
 /// Asks the system to report any change in the vault: `changed` is raised
@@ -360,20 +204,22 @@ pub fn rescan_full(root: &Path, known: &[Note]) -> (Vec<Note>, Vec<PathBuf>, Vec
         }
     }
     let note = |(path, mtime): &(PathBuf, SystemTime)| {
-        let (tags, links, aliases, body, lower) = match known.get(path.as_path()) {
-            Some(note) if note.mtime == *mtime => (note.tags.clone(), note.links.clone(), note.aliases.clone(), note.body.clone(), note.lower.clone()),
-            _ => {
-                let text = fs::read_to_string(path).unwrap_or_default();
-                let (tags, links) = markdown::index(&text);
-                let body = Arc::from(text);
-                let lower = lowered(&body);
-                (tags.into(), links.into(), markdown::aliases(&body).into(), body, lower)
+        let template = in_templates(root, path);
+        match known.get(path.as_path()) {
+            // Unchanged on disk: reused as is.
+            Some(old) if old.mtime == *mtime => {
+                // Shared lists, nothing reparsed; a template keeps none of them.
+                let mut note = (*old).clone();
+                if template {
+                    (note.tags, note.links, note.aliases) = (Arc::from([]), Arc::from([]), Arc::from([]));
+                }
+                note
             }
-        };
-        // A template has no tags, links or aliases: what it writes between `{{ }}` or after `#` is not its own.
-        let (tags, links, aliases) =
-            if in_templates(root, path) { (Vec::new().into(), Vec::new().into(), Vec::new().into()) } else { (tags, links, aliases) };
-        Note { name: stem(path), tags, links, aliases, mtime: *mtime, path: path.clone(), body, lower }
+            _ => {
+                let text = Arc::from(fs::read_to_string(path).unwrap_or_default());
+                Note::from_text(stem(path), path.clone(), *mtime, text, template)
+            }
+        }
     };
     let mut notes: Vec<Note> = files.iter().map(note).collect();
     notes.sort_by_key(|note| std::cmp::Reverse(note.mtime));
@@ -393,31 +239,121 @@ pub fn clean_name(name: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Moves or renames, never overwriting what already has that name.
+/// The entry of `dir` called `file` (a file name), ignoring case: the file systems of Windows and
+/// macOS do, so a name that differs only by case is taken there, and would be a trap elsewhere.
+pub fn name_taken(dir: &Path, file: &str) -> Option<PathBuf> {
+    let want = file.to_lowercase();
+    fs::read_dir(dir).ok()?.flatten().find(|entry| entry.file_name().to_string_lossy().to_lowercase() == want).map(|entry| entry.path())
+}
+
+/// `to` is the name of something that is not `from` (only the case of its own name may change).
+pub fn taken_by_other(from: &Path, to: &Path) -> bool {
+    let taken = to.parent().zip(to.file_name()).and_then(|(dir, file)| name_taken(dir, &file.to_string_lossy()));
+    taken.is_some_and(|other| other != from)
+}
+
+/// Moves or renames, never overwriting what already has that name. Only the case of
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    if to.exists() {
+    if taken_by_other(from, to) {
         let taken = tr("this name is already taken", "ce nom est déjà pris");
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, taken));
     }
     fs::rename(from, to)
 }
 
+/// Text of a new note called `name`: its title and a blank line to write under it.
+pub fn new_note_text(name: &str) -> String {
+    format!("# {name}\n\n")
+}
+
+/// Where the note goes when its title says `title`: the file follows the title only if it did
+/// until now (`synced`). `None`: it keeps its name. The caller still refuses a name that is taken.
+pub fn title_rename(path: &Path, title: &str, synced: bool) -> Option<PathBuf> {
+    (synced && stem(path) != title).then(|| path.with_file_name(format!("{title}.md")))
+}
+
 /// Renames a note and returns its path. If its name followed its title, the
-/// first line is rewritten so they stay in step.
+/// first line is rewritten so they stay in step; if that write fails, the rename is undone.
 pub fn rename_note(path: &Path, name: &str) -> io::Result<PathBuf> {
-    let content = fs::read_to_string(path)?;
     let to = path.with_file_name(format!("{name}.md"));
     rename(path, &to)?;
-    // The front matter stays as is: the title is the first line after it.
+    if let Err(e) = retitle(&to, &stem(path), name) {
+        rename(&to, path).ok();
+        return Err(e);
+    }
+    Ok(to)
+}
+
+/// The note's title was `old` (its former name): its first line becomes `new`, written atomically.
+/// The front matter stays as is: the title is the first line after it.
+pub fn retitle(path: &Path, old: &str, new: &str) -> io::Result<()> {
+    let content = fs::read_to_string(path)?;
     let (meta, body) = content.split_at(markdown::front_matter(&content));
-    if stem(path) == title_of(&content)
+    if old == title_of(&content)
         && let Some(first) = body.lines().find(|l| !l.trim().is_empty())
     {
         let hashes = first.trim_start().chars().take_while(|c| *c == '#').count();
-        let title = if hashes > 0 { format!("{} {name}", "#".repeat(hashes)) } else { name.to_string() };
-        fs::write(&to, format!("{meta}{}", body.replacen(first, &title, 1)))?;
+        let title = if hashes > 0 { format!("{} {new}", "#".repeat(hashes)) } else { new.to_string() };
+        write(path, format!("{meta}{}", body.replacen(first, &title, 1)))?;
     }
-    Ok(to)
+    Ok(())
+}
+
+/// Heading `was` of the note at `path` is now `now`: the other notes that link to it, `[[Note#was]]` and
+/// `![[Note#was]]`, are rewritten on disk and re-indexed. Returns the notes rewritten.
+pub fn follow_heading(root: Option<&Path>, notes: &mut [Note], path: &Path, was: &str, now: &str) -> Vec<PathBuf> {
+    let (name, key) = (stem(path), crate::logic::note::NoteKey::of(&stem(path)));
+    let mut rewritten = Vec::new();
+    for note in notes.iter_mut().filter(|n| n.path != path && n.links.contains(&key)) {
+        let fresh = fs::read_to_string(&note.path)
+            .ok()
+            .map(|text| crate::logic::embed::rename_heading(&text, &name, was, now))
+            .filter(|(_, count)| *count > 0)
+            .filter(|(text, _)| write(&note.path, text).is_ok());
+        if let Some((text, _)) = fresh {
+            note.set_text(text.as_str().into(), root.is_some_and(|r| in_templates(r, &note.path)));
+            rewritten.push(note.path.clone());
+        }
+    }
+    rewritten
+}
+
+/// What `relink` did: the notes rewritten, and those it could not read or write (with why).
+#[derive(Default)]
+pub struct Relinked {
+    pub rewritten: Vec<PathBuf>,
+    pub failed: Vec<(PathBuf, io::Error)>,
+}
+
+/// `[[old]]` becomes `[[new]]` in every note that links to it, on disk and in the index, unless
+/// another note is still called `old` (the links may be meant for it). A note that cannot be read or
+/// written is skipped, kept in `failed`: the others are still rewritten.
+pub fn relink(root: Option<&Path>, notes: &mut [Note], old: &str, new: &str) -> Relinked {
+    let Some(targets) = crate::logic::wiki::relink_set(notes, old, new) else {
+        return Relinked::default();
+    };
+    let paths: Vec<PathBuf> = targets.iter().map(|n| n.path.clone()).collect();
+    let mut done = Relinked::default();
+    for note in notes.iter_mut().filter(|n| paths.contains(&n.path)) {
+        let text = match fs::read_to_string(&note.path) {
+            Ok(text) => text,
+            Err(e) => {
+                done.failed.push((note.path.clone(), e));
+                continue;
+            }
+        };
+        let Some(text) = markdown::relink(&text, old, new) else {
+            continue;
+        };
+        match write(&note.path, &text) {
+            Ok(()) => {
+                note.set_text(text.as_str().into(), root.is_some_and(|r| in_templates(r, &note.path)));
+                done.rewritten.push(note.path.clone());
+            }
+            Err(e) => done.failed.push((note.path.clone(), e)),
+        }
+    }
+    done
 }
 
 /// Moves the note or folder to the vault's trash: the hidden folder
@@ -425,16 +361,7 @@ pub fn rename_note(path: &Path, name: &str) -> io::Result<PathBuf> {
 pub fn trash(root: &Path, path: &Path) -> io::Result<PathBuf> {
     let bin = root.join(".trash");
     fs::create_dir_all(&bin)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let free = (1..)
-        .map(|n| match n {
-            1 => bin.join(&*name),
-            n => bin.join(format!("{n} {name}")),
-        })
-        .find(|p| !p.exists())
-        .unwrap();
-    fs::rename(path, &free)?;
-    Ok(free)
+    move_to_free(path, &bin)
 }
 
 /// Vault file that keeps the icons: one `icon<tab>path` line per item,
@@ -457,236 +384,19 @@ pub fn save_icons(root: &Path, icons: &HashMap<PathBuf, String>) -> io::Result<(
     write(&root.join(ICONS), &lines.concat())
 }
 
-/// The commands to try, in order, to open a terminal in `dir` under the system
-/// `os` (`std::env::consts::OS`): the program and its arguments. `preferred` is the terminal
-/// the user names in `$TERMINAL`.
-pub fn terminals(os: &str, dir: &str, preferred: Option<&str>) -> Vec<(String, Vec<String>)> {
-    let command = |program: &str, args: &[&str]| (program.to_string(), args.iter().map(|a| a.to_string()).collect());
-    match os {
-        "macos" => vec![command("open", &["-a", "Terminal", dir])],
-        // Windows Terminal if installed, otherwise the classic console.
-        "windows" => vec![command("wt", &["-d", dir]), command("cmd", &["/c", "start", "cmd"])],
-        // Linux has no single answer. Those that merely notify an already running instance
-        // ignore the current folder: it is given to them as an argument.
-        _ => {
-            let mut all: Vec<_> = preferred.iter().map(|p| command(p, &[])).collect();
-            all.extend([
-                command("xdg-terminal-exec", &[]),
-                command("x-terminal-emulator", &[]),
-                command("gnome-terminal", &["--working-directory", dir]),
-                command("ptyxis", &["--new-window", "-d", dir]),
-                command("kgx", &["--working-directory", dir]),
-                command("konsole", &["--workdir", dir]),
-                command("kitty", &[]),
-                command("alacritty", &[]),
-                command("foot", &[]),
-                command("wezterm", &["start", "--cwd", dir]),
-                command("xterm", &[]),
-            ]);
-            all
-        }
+/// `from` became `to` (a file, or a folder and what it holds): its icons follow. False if none did.
+pub fn move_icons(icons: &mut HashMap<PathBuf, String>, from: &Path, to: &Path) -> bool {
+    if !icons.keys().any(|p| p.starts_with(from)) {
+        return false;
     }
+    *icons = icons.drain().map(|(path, icon)| (if let Ok(rest) = path.strip_prefix(from) { to.join(rest) } else { path }, icon)).collect();
+    true
 }
 
-/// Opens the system terminal in `dir`: the first of `terminals` that starts. False if
-/// none is installed. Tests open nothing.
-pub fn open_terminal(dir: &Path) -> bool {
-    let preferred = env::var("TERMINAL").ok().filter(|t| !t.trim().is_empty());
-    let found = terminals(env::consts::OS, &dir.to_string_lossy(), preferred.as_deref());
-    !cfg!(test)
-        && found.into_iter().any(|(program, args)| {
-            // No console for the launcher (`cmd /c start`); the terminal opens its own.
-            let child = crate::platform::command(&program).args(args).current_dir(dir).stdin(std::process::Stdio::null()).spawn();
-            // Once the terminal is closed, its process is reaped: no zombie while Bref runs.
-            child.map(|mut child| std::thread::spawn(move || child.wait())).is_ok()
-        })
-}
-
-/// Keys offered for capture; free on a stock GNOME.
-const CAPTURE_KEYS: &str = "<Super><Shift>n";
-const GNOME_KEYS: &str = "org.gnome.settings-daemon.plugins.media-keys";
-/// A path of our own in GNOME's custom shortcuts: asking again doubles nothing.
-const GNOME_PATH: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/bref-capture/";
-
-/// What asking for a capture shortcut gave.
-#[derive(Debug, PartialEq)]
-pub enum Shortcut {
-    /// Set in the desktop settings: the keys, as read.
-    Bound(String),
-    /// Set without keys, the offered ones being taken: here they are, to choose in the settings.
-    Unbound(String),
-    /// This desktop cannot be set from here: the command to bind yourself.
-    Manual(String),
-}
-
-/// Binds `exe --capture` to a desktop shortcut, never taking keys already
-/// in use. Under GNOME it is done from here; elsewhere the command is returned, to bind by hand.
-/// Blocking (a few `gsettings` calls): run off the UI thread. Tests
-/// touch no setting.
-pub fn capture_shortcut(exe: &Path) -> Shortcut {
-    let exe = exe.to_string_lossy();
-    let command = if exe.contains(' ') { format!("'{exe}' --capture") } else { format!("{exe} --capture") };
-    let gnome = !cfg!(test) && env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| desktop.contains("GNOME"));
-    gnome.then(|| gnome_shortcut(&command)).flatten().unwrap_or(Shortcut::Manual(command))
-}
-
-/// What `gsettings` answers, if it is there and accepts.
-fn gsettings(args: &[&str]) -> Option<String> {
-    let out = crate::platform::command("gsettings").args(args).stdin(std::process::Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// GNOME's custom shortcut "Bref: capture": created with `CAPTURE_KEYS` if nothing
-/// uses them, otherwise without keys. If it already exists, only its command is updated (the
-/// binary may have moved): the keys the user gave it stay.
-fn gnome_shortcut(command: &str) -> Option<Shortcut> {
-    let entry = format!("{GNOME_KEYS}.custom-keybinding:{GNOME_PATH}");
-    let list = gsettings(&["get", GNOME_KEYS, "custom-keybindings"])?;
-    let quoted = |text: &str| format!("'{}'", text.replace('\'', "\\'"));
-    let Some(longer) = with_keybinding(&list, GNOME_PATH) else {
-        gsettings(&["set", &entry, "command", &quoted(command)])?;
-        let keys = gsettings(&["get", &entry, "binding"])?;
-        let keys = keys.trim_matches('\'');
-        return Some(if keys.is_empty() { Shortcut::Unbound(spell_keys(CAPTURE_KEYS)) } else { Shortcut::Bound(spell_keys(keys)) });
-    };
-    // Taken: by a system shortcut, or by another custom shortcut.
-    let wanted = format!("'{}'", CAPTURE_KEYS.to_lowercase());
-    let others = list.split('\'').skip(1).step_by(2).filter_map(|path| gsettings(&["get", &format!("{GNOME_KEYS}.custom-keybinding:{path}"), "binding"]));
-    let taken = gsettings(&["list-recursively"]).is_some_and(|all| all.to_lowercase().contains(&wanted))
-        || others.into_iter().any(|keys| keys.to_lowercase() == wanted);
-    gsettings(&["set", &entry, "name", &quoted(tr("Bref: capture", "Bref : capture"))])?;
-    gsettings(&["set", &entry, "command", &quoted(command)])?;
-    if !taken {
-        gsettings(&["set", &entry, "binding", &quoted(CAPTURE_KEYS)])?;
-    }
-    gsettings(&["set", GNOME_KEYS, "custom-keybindings", &longer])?;
-    Some(if taken { Shortcut::Unbound(spell_keys(CAPTURE_KEYS)) } else { Shortcut::Bound(spell_keys(CAPTURE_KEYS)) })
-}
-
-/// The `['a', 'b']` list from `gsettings` (or `@as []`, empty) with `path` added; `None` if it
-/// is already there.
-fn with_keybinding(list: &str, path: &str) -> Option<String> {
-    let mut paths: Vec<&str> = list.split('\'').skip(1).step_by(2).collect();
-    if paths.contains(&path) {
-        return None;
-    }
-    paths.push(path);
-    Some(format!("[{}]", paths.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ")))
-}
-
-/// `<Super><Shift>n`, as GNOME writes it, as read: `Super+Shift+N`.
-fn spell_keys(keys: &str) -> String {
-    let parts = keys.split(['<', '>']).filter(|part| !part.is_empty()).map(|part| match part {
-        "Shift" => tr("Shift", "Maj").to_string(),
-        "Primary" | "Control" => "Ctrl".to_string(),
-        _ => {
-            let mut chars = part.chars();
-            chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
-        }
-    });
-    parts.collect::<Vec<_>>().join("+")
-}
-
-/// Backup: the whole vault (trash included) in a `<vault> <date>.tar.gz` archive
-/// in folder `dir`, numbered if the name is taken. Blocking: run off the UI thread.
-// The archive is written here rather than by the system's `tar`: on Windows, both the one
-// Windows ships and Git for Windows' crash (access violation) on a name outside the ANSI
-// code page, such as `中文.md`. flate2 compresses; the tar format is a few headers.
-pub fn backup(root: &Path, dir: &Path, date: &str) -> io::Result<PathBuf> {
-    let Some(name) = root.file_name() else {
-        return Err(io::Error::other(tr("this vault has no parent folder", "ce coffre n'a pas de dossier parent")));
-    };
-    // Inside the vault, the archive would contain itself.
-    if dir.starts_with(root) {
-        return Err(io::Error::other(tr("choose a folder outside the vault", "choisir un dossier hors du coffre")));
-    }
-    let to = free_path(dir, &format!("{} {date}", name.to_string_lossy()), "tar.gz");
-    let written = fs::File::create_new(&to).and_then(|file| {
-        let mut gz = flate2::write::GzEncoder::new(io::BufWriter::new(file), flate2::Compression::default());
-        tar_entry(&mut gz, root, &name.to_string_lossy())?;
-        // The end of a tar: two empty blocks.
-        gz.write_all(&[0; 1024])?;
-        gz.finish()?.into_inner().map_err(|e| e.into_error())?.sync_all()
-    });
-    if let Err(e) = written {
-        // An incomplete archive must not pass for a backup.
-        let _ = fs::remove_file(&to);
-        return Err(e);
-    }
-    Ok(to)
-}
-
-/// Writes `path` into the tar under `name`, and a folder's contents after it, by name.
-fn tar_entry(out: &mut impl Write, path: &Path, name: &str) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-    #[cfg(unix)]
-    let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o7777;
-    #[cfg(not(unix))]
-    let mode = if meta.is_dir() { 0o755 } else { 0o644 };
-    if meta.is_symlink() {
-        let target = fs::read_link(path)?;
-        return tar_header(out, name, b'2', mode, 0, mtime, &target.to_string_lossy().replace('\\', "/"));
-    }
-    if meta.is_dir() {
-        tar_header(out, &format!("{name}/"), b'5', mode, 0, mtime, "")?;
-        let mut entries: Vec<_> = fs::read_dir(path)?.collect::<io::Result<_>>()?;
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            tar_entry(out, &entry.path(), &format!("{name}/{}", entry.file_name().to_string_lossy()))?;
-        }
-        return Ok(());
-    }
-    let mut file = fs::File::open(path)?;
-    let size = file.metadata()?.len();
-    tar_header(out, name, b'0', mode, size, mtime, "")?;
-    // Exactly `size` bytes, even if the file changes meanwhile: the header has already said how many.
-    let copied = io::copy(&mut io::Read::take(&mut file, size), out)?;
-    io::copy(&mut io::Read::take(io::repeat(0), size - copied), out)?;
-    out.write_all(&vec![0; (512 - size % 512) as usize % 512])
-}
-
-/// A ustar header; preceded by a pax one (UTF-8 by definition) when the name, the link
-/// or the size does not fit in its field.
-fn tar_header(out: &mut impl Write, name: &str, kind: u8, mode: u32, size: u64, mtime: u64, link: &str) -> io::Result<()> {
-    let fits = |s: &str, n: usize| s.is_ascii() && s.len() <= n;
-    let mut pax = String::new();
-    for (key, value, needed) in [("path", name, !fits(name, 100)), ("linkpath", link, !fits(link, 100)), ("size", &size.to_string(), size >= 1 << 33)] {
-        if needed {
-            // Each record starts with its own length, digits included.
-            let body = format!(" {key}={value}\n");
-            let mut len = body.len() + 1;
-            while (len.to_string().len() + body.len()) != len {
-                len = len.to_string().len() + body.len();
-            }
-            pax.push_str(&format!("{len}{body}"));
-        }
-    }
-    if !pax.is_empty() {
-        tar_header(out, "././@PaxHeader", b'x', 0o644, pax.len() as u64, mtime, "")?;
-        out.write_all(pax.as_bytes())?;
-        out.write_all(&vec![0; (512 - pax.len() % 512) % 512])?;
-    }
-    let mut block = [0u8; 512];
-    let mut put = |at: usize, len: usize, bytes: &[u8]| {
-        let n = bytes.len().min(len);
-        block[at..at + n].copy_from_slice(&bytes[..n]);
-    };
-    // Past the field: the pax header above has the whole of it.
-    let ascii = |s: &str| s.chars().map(|c| if c.is_ascii() { c } else { '_' }).collect::<String>();
-    put(0, 100, ascii(name).as_bytes());
-    put(100, 8, format!("{:07o}\0", mode).as_bytes());
-    put(108, 8, b"0000000\0");
-    put(116, 8, b"0000000\0");
-    put(124, 12, format!("{:011o}\0", size.min((1 << 33) - 1)).as_bytes());
-    put(136, 12, format!("{:011o}\0", mtime.min((1 << 33) - 1)).as_bytes());
-    put(148, 8, b"        ");
-    put(156, 1, &[kind]);
-    put(157, 100, ascii(link).as_bytes());
-    put(257, 8, b"ustar\x0000");
-    let sum: u32 = block.iter().map(|&b| b as u32).sum();
-    block[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-    out.write_all(&block)
+/// The same on the vault's icon file, for what renames without the app's state.
+pub fn relocate_icons(root: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    let mut icons = load_icons(root);
+    if move_icons(&mut icons, from, to) { save_icons(root, &icons) } else { Ok(()) }
 }
 
 /// Contents of the vault's trash, most recently modified first.
@@ -701,27 +411,54 @@ pub fn trashed(root: &Path) -> Vec<PathBuf> {
 /// Takes `path` out of the trash and puts it back at the vault root (the trash does not keep
 /// where it came from), under its name, numbered if taken: nothing is overwritten.
 pub fn restore(root: &Path, path: &Path) -> io::Result<PathBuf> {
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let extension = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    let free = (1..)
-        .map(|n| match n {
-            1 => root.join(format!("{stem}{extension}")),
-            n => root.join(format!("{stem} {n}{extension}")),
-        })
-        .find(|p| !p.exists())
-        .unwrap();
-    fs::rename(path, &free)?;
+    move_to_free(path, root)
+}
+
+/// Moves `path` into `dir` under a free name, which is reserved first (`reserve`): two movers never
+/// pick the same name, and nothing is overwritten. The reservation, still empty, is what the rename
+/// replaces; if the move fails it is taken away again.
+fn move_to_free(path: &Path, dir: &Path) -> io::Result<PathBuf> {
+    // A missing source fails here, before a placeholder is created (it could be the very name asked for).
+    let folder = path.symlink_metadata()?.is_dir();
+    let free = reserve(dir, path.file_name().unwrap_or_default(), folder)?;
+    let mut moved = fs::rename(path, &free);
+    if moved.is_err() && folder && cfg!(windows) {
+        // Windows does not rename a folder onto another, even an empty one: step aside (the name could be
+        // taken in this gap, then the rename fails and nothing is lost).
+        let _ = fs::remove_dir(&free);
+        moved = fs::rename(path, &free);
+    }
+    if let Err(e) = moved {
+        let _ = if folder { fs::remove_dir(&free) } else { fs::remove_file(&free) };
+        return Err(e);
+    }
     Ok(free)
 }
 
-/// Free path in `dir` for a file `name.extension`: the name is followed
-/// by a number if already taken.
+/// Free path in `dir` for `name.extension` (no dot if `extension` is empty): the name is followed
+/// by a number if taken, `name 2.extension`, `name 3.extension`… Nothing is overwritten. Case is
+/// ignored (see `name_taken`), and a dangling link counts as taken.
 pub fn free_path(dir: &Path, name: &str, extension: &str) -> PathBuf {
-    let numbered = (1..).map(|n| match n {
-        1 => dir.join(format!("{name}.{extension}")),
-        n => dir.join(format!("{name} {n}.{extension}")),
-    });
-    numbered.into_iter().find(|p| !p.exists()).unwrap()
+    let taken: HashSet<String> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect();
+    let dot = if extension.is_empty() { "" } else { "." };
+    (1..)
+        .map(|n| if n == 1 { format!("{name}{dot}{extension}") } else { format!("{name} {n}{dot}{extension}") })
+        .find(|file| !taken.contains(&file.to_lowercase()) && dir.join(file).symlink_metadata().is_err())
+        .map(|file| dir.join(file))
+        .unwrap()
+}
+
+/// `free_path`, created empty in the same step (`create_new`): two writers choosing a name at once
+/// never share it, the second one gets the next number.
+pub fn create_free(dir: &Path, name: &str, extension: &str) -> io::Result<(PathBuf, fs::File)> {
+    loop {
+        let path = free_path(dir, name, extension);
+        match fs::File::create_new(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// File name (without extension) taken from the first non-empty line.
@@ -747,31 +484,33 @@ pub struct Imported {
     pub files: usize,
 }
 
-/// A free name in `dir`: `name.ext`, then `name 2.ext`, `name 3.ext`… Nothing is ever overwritten.
+/// A free name in `dir` for a dropped item: a file keeps its extension, a folder's name is whole.
 fn free_name(dir: &Path, name: &std::ffi::OsStr, folder: bool) -> PathBuf {
     let as_path = Path::new(name);
-    let (stem, ext) = match (folder, as_path.extension()) {
-        (false, Some(ext)) => (as_path.file_stem().unwrap_or(name).to_string_lossy().into_owned(), Some(ext.to_string_lossy().into_owned())),
-        _ => (name.to_string_lossy().into_owned(), None),
-    };
-    (1..)
-        .map(|n| {
-            let numbered = if n == 1 { stem.clone() } else { format!("{stem} {n}") };
-            dir.join(match &ext {
-                Some(ext) => format!("{numbered}.{ext}"),
-                None => numbered,
-            })
-        })
-        .find(|path| !path.exists() && path.symlink_metadata().is_err())
-        .unwrap()
+    match (folder, as_path.extension()) {
+        (false, Some(ext)) => free_path(dir, &as_path.file_stem().unwrap_or(name).to_string_lossy(), &ext.to_string_lossy()),
+        _ => free_path(dir, &name.to_string_lossy(), ""),
+    }
 }
 
-/// Copies `from` to `to`: a file is first written under a hidden name then renamed, so an interrupted
-/// copy never leaves a half file. Returns the number of files copied and of items
+/// `free_name`, created empty in the same step (`create_dir` or `create_new`, which fail if the name
+/// exists): a name one asks for is never one somebody else holds.
+fn reserve(dir: &Path, name: &std::ffi::OsStr, folder: bool) -> io::Result<PathBuf> {
+    loop {
+        let free = free_name(dir, name, folder);
+        match if folder { fs::create_dir(&free) } else { fs::File::create_new(&free).map(drop) } {
+            Ok(()) => return Ok(free),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Copies `from` to `to`, which exists already, empty (see `reserve`): a file is first written under a
+/// hidden name then renamed over it, so an interrupted copy never leaves a half file. Returns the number of files copied and of items
 /// left out (symbolic links, hidden files, things other than files).
 fn copy_into(from: &Path, to: &Path, skipped: &mut usize) -> io::Result<usize> {
     if from.is_dir() {
-        fs::create_dir(to)?;
         let mut entries: Vec<_> = fs::read_dir(from)?.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         let mut files = 0;
@@ -781,7 +520,11 @@ fn copy_into(from: &Path, to: &Path, skipped: &mut usize) -> io::Result<usize> {
                 *skipped += 1;
                 continue;
             }
-            files += copy_into(&path, &to.join(entry.file_name()), skipped)?;
+            let inside = to.join(entry.file_name());
+            if kind.is_dir() {
+                fs::create_dir(&inside)?;
+            }
+            files += copy_into(&path, &inside, skipped)?;
         }
         return Ok(files);
     }
@@ -808,7 +551,13 @@ pub fn import(sources: &[PathBuf], dir: &Path) -> (Vec<Imported>, Vec<String>) {
             Ok(_) if name.is_empty() || name.to_string_lossy().starts_with('.') => problems.push(format!("{shown} : hidden")),
             Ok(kind) if kind.is_dir() && dir.starts_with(from) => problems.push(format!("{shown} : a folder cannot be copied into itself")),
             Ok(kind) => {
-                let to = free_name(dir, name, kind.is_dir());
+                let to = match reserve(dir, name, kind.is_dir()) {
+                    Ok(to) => to,
+                    Err(e) => {
+                        problems.push(format!("{shown} : {e}"));
+                        continue;
+                    }
+                };
                 let mut skipped = 0;
                 match copy_into(from, &to, &mut skipped) {
                     Ok(files) => {
@@ -818,10 +567,8 @@ pub fn import(sources: &[PathBuf], dir: &Path) -> (Vec<Imported>, Vec<String>) {
                         done.push(Imported { to, dir: kind.is_dir(), files });
                     }
                     Err(e) => {
-                        // A half-copied folder goes entirely: nothing is left behind.
-                        if kind.is_dir() {
-                            let _ = fs::remove_dir_all(&to);
-                        }
+                        // A half-copied folder goes entirely, and the reserved name of a file: nothing is left behind.
+                        let _ = if kind.is_dir() { fs::remove_dir_all(&to) } else { fs::remove_file(&to) };
                         problems.push(format!("{shown} : {e}"));
                     }
                 }
@@ -834,15 +581,12 @@ pub fn import(sources: &[PathBuf], dir: &Path) -> (Vec<Imported>, Vec<String>) {
 /// Saves a pasted image in `dir`, under a free name, and returns that name.
 pub fn save_image(dir: &Path, extension: &str, bytes: &[u8]) -> io::Result<String> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let name = (1..)
-        .map(|n| match n {
-            1 => format!("image-{stamp}.{extension}"),
-            n => format!("image-{stamp}-{n}.{extension}"),
-        })
-        .find(|name| !dir.join(name).exists())
-        .unwrap();
-    fs::write(dir.join(&name), bytes)?;
-    Ok(name)
+    let (path, mut file) = create_free(dir, &format!("image-{stamp}"), extension)?;
+    if let Err(e) = file.write_all(bytes) {
+        let _ = fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(path.file_name().unwrap_or_default().to_string_lossy().into_owned())
 }
 
 /// Appends the line `text` at the bottom of the note named `name` (the daily note), wherever it is
@@ -873,7 +617,7 @@ pub fn capture(root: &Path, name: &str, text: &str) -> io::Result<PathBuf> {
     let path = found.unwrap_or_else(|| root.join(&file));
     let mut body = match fs::read_to_string(&path) {
         Ok(body) => body,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => format!("# {name}\n\n"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => new_note_text(name),
         Err(e) => return Err(e),
     };
     if !body.ends_with('\n') {
@@ -888,12 +632,52 @@ pub fn capture(root: &Path, name: &str, text: &str) -> io::Result<PathBuf> {
 
 /// Atomic write: a crash never leaves a truncated note.
 pub fn write(path: &Path, content: impl AsRef<[u8]>) -> io::Result<()> {
-    let tmp = path.with_file_name(format!(".{}.tmp", stem(path)));
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(content.as_ref())?;
-    // Without `fsync`, a power cut can leave the rename without the data.
-    file.sync_all()?;
-    fs::rename(&tmp, path)
+    let (tmp, mut file) = staging(path)?;
+    let result = (|| {
+        file.write_all(content.as_ref())?;
+        // Without `fsync`, a power cut can leave the rename without the data.
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        fs::remove_file(&tmp).ok();
+    }
+    result
+}
+
+/// Paths whose next writes fail, so a test can play a failed save on every platform.
+#[cfg(test)]
+static REFUSED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Makes every write of `path` fail (`on`), or succeed again.
+#[cfg(test)]
+pub fn refuse_writes(path: &Path, on: bool) {
+    let mut refused = REFUSED.lock().unwrap();
+    refused.retain(|p| p != path);
+    if on {
+        refused.push(path.to_path_buf());
+    }
+}
+
+/// A new hidden file beside `path`, for an atomic write. Its name is unique to this process
+/// and this write: two files of the same stem (`Note.md`, `Note.csv`), or the app and
+/// `bref mcp` saving the same note at once, never share it.
+pub fn staging(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(test)]
+    if REFUSED.lock().unwrap().iter().any(|p| p == path) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "refused by a test"));
+    }
+    loop {
+        // Not built from the file's name: a name near the length limit would leave no room.
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_file_name(format!(".bref-{}-{n}.tmp", std::process::id()));
+        match fs::File::create_new(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Saves the note and returns its path; a new note is created in
@@ -908,20 +692,16 @@ pub fn save(
 ) -> io::Result<PathBuf> {
     let title = title_of(content);
     let target = match current {
-        Some(p) if !synced || stem(p) == title => p.to_path_buf(),
-        Some(p) => {
-            let renamed = p.with_file_name(format!("{title}.md"));
-            if renamed.exists() { p.to_path_buf() } else { renamed }
-        }
-        None => (1..)
-            .map(|n| match n {
-                1 => dir.join(format!("{title}.md")),
-                n => dir.join(format!("{title} {n}.md")),
-            })
-            .find(|p| !p.exists())
-            .unwrap(),
+        Some(p) => title_rename(p, &title, synced).filter(|to| !taken_by_other(p, to)).unwrap_or_else(|| p.to_path_buf()),
+        None => create_free(dir, &title, "md")?.0,
     };
-    write(&target, content)?;
+    if let Err(e) = write(&target, content) {
+        // A name reserved for a new note is not left empty behind a failed write.
+        if current.is_none() {
+            let _ = fs::remove_file(&target);
+        }
+        return Err(e);
+    }
     if let Some(old) = current
         && old != target
     {
@@ -933,52 +713,7 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sorts_names_naturally() {
-        let mut names = vec!["Note 10", "note 2", "Note 1", "Notes", "2026-10-09", "2026-9-30", "Note 1b"];
-        names.sort_by_cached_key(|n| natural(n));
-        assert_eq!(names, ["2026-9-30", "2026-10-09", "Note 1", "Note 1b", "note 2", "Note 10", "Notes"]);
-    }
-
-    #[test]
-    fn gnome_shortcut_list_gains_the_capture_once() {
-        let path = "/org/gnome/x/bref-capture/";
-        assert_eq!(with_keybinding("@as []", path).as_deref(), Some("['/org/gnome/x/bref-capture/']"));
-        assert_eq!(with_keybinding("['/org/gnome/x/custom0/', '/org/gnome/x/custom1/']", path).as_deref(), Some("['/org/gnome/x/custom0/', '/org/gnome/x/custom1/', '/org/gnome/x/bref-capture/']"));
-        // Already there: nothing to add, the request can repeat without doubling anything.
-        assert_eq!(with_keybinding("['/org/gnome/x/custom0/', '/org/gnome/x/bref-capture/']", path), None);
-    }
-
-    #[test]
-    fn gnome_keys_are_spelled_like_the_others() {
-        assert_eq!(spell_keys("<Super><Shift>n"), "Super+Maj+N");
-        assert_eq!(spell_keys("<Primary><Alt>space"), "Ctrl+Alt+Space");
-        assert_eq!(spell_keys("F9"), "F9");
-    }
-
-    /// The real `gsettings`, on throwaway settings (key-value file in a temporary
-    /// folder): `cargo test -- --ignored gnome_shortcut_is_registered`, on a GNOME machine.
-    #[test]
-    #[ignore]
-    fn gnome_shortcut_is_registered() {
-        let dir = std::env::temp_dir().join(format!("bref-gsettings-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        unsafe {
-            std::env::set_var("GSETTINGS_BACKEND", "keyfile");
-            std::env::set_var("XDG_CONFIG_HOME", &dir);
-        }
-        assert_eq!(gnome_shortcut("/usr/bin/bref --capture"), Some(Shortcut::Bound("Super+Maj+N".into())));
-        let saved = fs::read_to_string(dir.join("glib-2.0/settings/keyfile")).unwrap();
-        assert!(saved.contains("command='/usr/bin/bref --capture'") && saved.contains("binding='<Super><Shift>n'"), "{saved}");
-        // Asked again after the binary moved: the command follows, the chosen key stays.
-        gsettings(&["set", &format!("{GNOME_KEYS}.custom-keybinding:{GNOME_PATH}"), "binding", "<Super>F9"]).unwrap();
-        assert_eq!(gnome_shortcut("/opt/bref --capture"), Some(Shortcut::Bound("Super+F9".into())));
-        let saved = fs::read_to_string(dir.join("glib-2.0/settings/keyfile")).unwrap();
-        assert!(saved.contains("command='/opt/bref --capture'") && saved.matches("bref-capture").count() == 2, "{saved}");
-        let _ = fs::remove_dir_all(&dir);
-    }
+    use std::env;
 
     #[test]
     fn capture_appends_a_line_to_the_note_of_the_day() {
@@ -1003,44 +738,49 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Runs a future on the current thread, which sleeps between wakeups.
-    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
-        struct Unpark(std::thread::Thread);
-        impl std::task::Wake for Unpark {
-            fn wake(self: Arc<Self>) {
-                self.0.unpark();
-            }
-        }
-        let waker = Arc::new(Unpark(std::thread::current())).into();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut future = std::pin::pin!(future);
-        loop {
-            if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
-                return value;
-            }
-            std::thread::park_timeout(std::time::Duration::from_secs(5));
-        }
+    #[test]
+    fn a_name_is_taken_whatever_its_case() {
+        let root = env::temp_dir().join(format!("bref-taken-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Dossier")).unwrap();
+        fs::write(root.join("Plan.md"), "# Plan\n\n").unwrap();
+        assert_eq!(name_taken(&root, "plan.MD"), Some(root.join("Plan.md")));
+        assert_eq!(name_taken(&root, "dossier"), Some(root.join("Dossier")));
+        assert_eq!((name_taken(&root, "Autre.md"), name_taken(&root.join("absent"), "x")), (None, None));
+        // Another file refuses the name, even in other letters; the file itself may change case.
+        fs::write(root.join("B.md"), "").unwrap();
+        assert!(rename(&root.join("B.md"), &root.join("pLAN.md")).is_err());
+        rename(&root.join("B.md"), &root.join("b.md")).unwrap();
+        assert!(root.join("b.md").exists());
+        // The title renames the file only while it follows it; the empty-ish names stay as they are.
+        let path = root.join("Plan.md");
+        assert_eq!(title_rename(&path, "Autre", true), Some(root.join("Autre.md")));
+        assert_eq!((title_rename(&path, "Autre", false), title_rename(&path, "Plan", true)), (None, None));
+        assert_eq!(new_note_text("Plan"), "# Plan\n\n");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn signal_wakes_a_sleeping_task() {
-        let signal = Arc::new(Signal::default());
-        // Raised before the wait: no sleep. Dropped afterwards.
-        signal.raise();
-        assert!(block_on(signal.wait(std::future::pending())));
-        assert!(!signal.take());
-        // Deadline passed, no signal: false.
-        assert!(!block_on(signal.wait(std::future::ready(()))));
-        // Raised by another thread while the task sleeps.
-        let other = signal.clone();
-        let thread = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            other.raise();
-        });
-        let start = std::time::Instant::now();
-        assert!(block_on(signal.wait(std::future::pending())));
-        assert!(start.elapsed() < std::time::Duration::from_secs(4));
-        thread.join().unwrap();
+    fn free_names_are_numbered_and_reserved() {
+        let root = env::temp_dir().join(format!("bref-free-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(free_path(&root, "Note", "md"), root.join("Note.md"));
+        // Reserved at once: the next asker gets the next number; case is ignored.
+        let (first, _) = create_free(&root, "Note", "md").unwrap();
+        let (second, _) = create_free(&root, "note", "MD").unwrap();
+        let (third, _) = create_free(&root, "Note", "md").unwrap();
+        assert_eq!((first, second, third), (root.join("Note.md"), root.join("note 2.MD"), root.join("Note 3.md")));
+        assert_eq!(free_path(&root, "Dossier", ""), root.join("Dossier"));
+        // A new note takes the number, and a failed write leaves no empty file behind.
+        fs::write(root.join("Idée.md"), "# Idée\n").unwrap();
+        let made = save(&root, None, false, "# Idée\nautre").unwrap();
+        assert_eq!(made, root.join("Idée 2.md"));
+        refuse_writes(&root.join("Idée 3.md"), true);
+        assert!(save(&root, None, false, "# Idée\nencore").is_err());
+        refuse_writes(&root.join("Idée 3.md"), false);
+        assert!(!root.join("Idée 3.md").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1091,6 +831,22 @@ mod tests {
         fs::File::options().write(true).open(&drawing).unwrap().set_modified(later).unwrap();
         assert_ne!(before, fingerprint(&root));
         fs::remove_file(&drawing).unwrap();
+        // So does an attachment added by another program: the tree shows it.
+        let before = fingerprint(&root);
+        fs::write(root.join("facture.pdf"), "%PDF").unwrap();
+        assert_ne!(before, fingerprint(&root));
+        fs::remove_file(root.join("facture.pdf")).unwrap();
+        // Two files of the same stem never share a temporary file, and none is left behind.
+        let (a, _) = staging(&root.join("Note.md")).unwrap();
+        let (b, _) = staging(&root.join("Note.csv")).unwrap();
+        let (c, _) = staging(&root.join("Note.md")).unwrap();
+        assert!(a != b && a != c && b != c);
+        for t in [a, b, c] {
+            fs::remove_file(t).unwrap();
+        }
+        write(&root.join("Note.md"), "# Note\n").unwrap();
+        assert!(!fs::read_dir(&root).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".tmp")));
+        fs::remove_file(root.join("Note.md")).unwrap();
 
         // Renaming a note in step with its title rewrites that title; otherwise the text stays as is.
         let c = rename_note(&root.join("A 2.md"), "C").unwrap();
@@ -1098,6 +854,13 @@ mod tests {
         fs::write(root.join("D.md"), "\n## D\ntexte D\n").unwrap();
         let e = rename_note(&root.join("D.md"), "E").unwrap();
         assert_eq!(fs::read_to_string(&e).unwrap(), "\n## E\ntexte D\n");
+        // A title that cannot be written leaves the note under its old name.
+        fs::write(root.join("F.md"), "# F\n").unwrap();
+        refuse_writes(&root.join("G.md"), true);
+        assert!(rename_note(&root.join("F.md"), "G").is_err());
+        refuse_writes(&root.join("G.md"), false);
+        assert!(root.join("F.md").exists() && !root.join("G.md").exists());
+        fs::remove_file(root.join("F.md")).unwrap();
         // Never overwrite.
         assert!(rename_note(&e, "C").is_err() && e.exists());
 
@@ -1107,13 +870,12 @@ mod tests {
         fs::write(&c, "autre").unwrap();
         trash(&root, &c).unwrap();
         assert_eq!(fs::read_to_string(root.join(".trash/C.md")).unwrap(), "# A\n");
-        assert_eq!(fs::read_to_string(root.join(".trash/2 C.md")).unwrap(), "autre");
+        assert_eq!(fs::read_to_string(root.join(".trash/C 2.md")).unwrap(), "autre");
         fs::write(root.join("vide/Photo.PNG"), "").unwrap();
         let (notes, dirs, images) = scan(&root);
         assert_eq!((notes.len(), dirs), (2, vec![root.join("vide")]));
         // Each note keeps its text as is, and the same in lowercase for search.
-        assert!(notes.iter().all(|n| !n.body.is_empty() && *n.lower == n.body.to_lowercase()));
-        assert!(notes.iter().any(|n| n.lower != n.body));
+        assert!(notes.iter().all(|n| !n.body.is_empty()));
         assert_eq!(images, [root.join("vide/Photo.PNG")]);
         assert_eq!(clean_name(" ../a:b. "), Some("ab".into()));
         assert_eq!(clean_name(" . "), None);
@@ -1133,40 +895,44 @@ mod tests {
     }
 
     #[test]
-    fn picks_the_terminal_of_the_system() {
-        let programs = |os, preferred| terminals(os, "/coffre", preferred).into_iter().map(|(p, _)| p).collect::<Vec<_>>();
-        assert_eq!(terminals("macos", "/coffre", None), [("open".to_string(), vec!["-a".to_string(), "Terminal".into(), "/coffre".into()])]);
-        assert_eq!(programs("windows", Some("kitty")), ["wt", "cmd"]);
-        // `$TERMINAL` comes first; without it, the desktop's choice first.
-        assert_eq!(programs("linux", Some("foot"))[..2], ["foot", "xdg-terminal-exec"]);
-        assert_eq!(programs("linux", None)[0], "xdg-terminal-exec");
-        let gnome = terminals("linux", "/coffre", None).into_iter().find(|(p, _)| p == "gnome-terminal").unwrap();
-        assert_eq!(gnome.1, ["--working-directory", "/coffre"]);
-    }
-
-    #[test]
-    fn backs_up_the_vault() {
-        let base = env::temp_dir().join(format!("bref-backup-{}", std::process::id()));
-        let (root, out) = (base.join("Mon coffre"), base.join("sauvegardes"));
-        fs::create_dir_all(root.join(".trash")).unwrap();
-        fs::create_dir_all(&out).unwrap();
-        fs::write(root.join("A.md"), "# A\n").unwrap();
-        fs::write(root.join(".trash/Vieux.md"), "jeté").unwrap();
-        fs::write(root.join("abz文cd.md"), "# abz文cd\n").unwrap();
-        let first = backup(&root, &out, "2026-10-09").unwrap();
-        assert_eq!(first, out.join("Mon coffre 2026-10-09.tar.gz"));
-        // Same day: a second archive, the first one stays.
-        assert_eq!(backup(&root, &out, "2026-10-09").unwrap(), out.join("Mon coffre 2026-10-09 2.tar.gz"));
-        let mut listed = Vec::new();
-        io::Read::read_to_end(&mut flate2::read::GzDecoder::new(fs::File::open(&first).unwrap()), &mut listed).unwrap();
-        let listed = String::from_utf8_lossy(&listed);
-        assert!(listed.contains("Mon coffre/A.md") && listed.contains("Mon coffre/.trash/Vieux.md") && listed.contains("jeté"), "{listed}");
-        // A name outside the ANSI code page goes in a pax header: Windows' `tar` crashed on it.
-        assert!(listed.contains("path=Mon coffre/abz文cd.md\n"), "{listed}");
-        // Inside the vault, the archive would contain itself: refused, nothing is written.
-        assert!(backup(&root, &root.join(".trash"), "2026-10-09").is_err());
-        assert_eq!(fs::read_dir(root.join(".trash")).unwrap().count(), 1);
-        fs::remove_dir_all(&base).unwrap();
+    fn concurrent_trash_and_restore_of_folders_never_share_a_name() {
+        let root = env::temp_dir().join(format!("bref-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for i in 0..8 {
+            fs::create_dir_all(root.join(format!("p{i}/Dossier"))).unwrap();
+            fs::write(root.join(format!("p{i}/Dossier/n.md")), format!("note {i}")).unwrap();
+        }
+        let trashed: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || trash(&root, &root.join(format!("p{i}/Dossier"))).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let mut contents: Vec<String> = trashed.iter().map(|p| fs::read_to_string(p.join("n.md")).unwrap()).collect();
+        contents.sort();
+        assert_eq!(contents, (0..8).map(|i| format!("note {i}")).collect::<Vec<_>>(), "no folder was merged into or replaced by another");
+        assert_eq!(trashed.iter().collect::<HashSet<_>>().len(), 8);
+        // The same going back: eight folders of one name restored at once.
+        let back: Vec<PathBuf> = trashed
+            .into_iter()
+            .map(|p| {
+                let root = root.clone();
+                std::thread::spawn(move || restore(&root, &p).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(back.iter().collect::<HashSet<_>>().len(), 8);
+        assert!(back.iter().all(|p| p.join("n.md").is_file()));
+        // A failed move leaves no reservation behind.
+        let before = fs::read_dir(&root).unwrap().count();
+        assert!(restore(&root, &root.join("absent")).is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1334,11 +1100,38 @@ mod tests {
         // No simulated clock here: the system takes a few milliseconds (FSEvents, a bit more).
         fs::write(root.join("neuve.md"), "x").unwrap();
         let start = std::time::Instant::now();
-        while !changed.raised.load(Ordering::Acquire) && start.elapsed() < std::time::Duration::from_secs(10) {
+        let mut seen = changed.take();
+        while !seen && start.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(50));
+            seen = changed.take();
         }
-        assert!(changed.take(), "no event in 10 s");
+        assert!(seen, "no event in 10 s");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A rescan reuses an unchanged note as is (no reparse), reads a changed one again, and a
+    /// template keeps no tags, links or aliases either way.
+    #[test]
+    fn rescan_reuses_unchanged_notes() {
+        let root = std::env::temp_dir().join(format!("bref-reuse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Templates")).unwrap();
+        let text = "---\naliases: [Pseudo]\n---\n#etiquette [[Cible]]\n";
+        fs::write(root.join("A.md"), text).unwrap();
+        fs::write(root.join("Templates/T.md"), text).unwrap();
+        let (first, ..) = rescan_full(&root, &[]);
+        let by = |notes: &[Note], name: &str| notes.iter().position(|n| n.name == name).unwrap();
+        assert_eq!(first[by(&first, "A")].aliases[..], ["Pseudo".to_string()]);
+        assert!(first[by(&first, "T")].aliases.is_empty());
+        let (again, ..) = rescan_full(&root, &first);
+        let (a, b) = (&first[by(&first, "A")], &again[by(&again, "A")]);
+        assert!(Arc::ptr_eq(&a.body, &b.body) && Arc::ptr_eq(&a.links, &b.links) && Arc::ptr_eq(&a.aliases, &b.aliases));
+        assert!(again[by(&again, "T")].tags.is_empty() && again[by(&again, "T")].aliases.is_empty());
+        // A note whose mtime moved is read again.
+        let known: Vec<Note> = first.iter().cloned().map(|mut n| { n.mtime = UNIX_EPOCH; n }).collect();
+        let (reread, ..) = rescan_full(&root, &known);
+        assert!(!Arc::ptr_eq(&a.body, &reread[by(&reread, "A")].body));
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A folder that cannot be listed is reported, root or inner, with the reason; the rest is read as

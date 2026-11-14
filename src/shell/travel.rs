@@ -5,8 +5,12 @@ use super::*;
 impl Shell {
     /// What is shown in place of the note; nothing for a new note not saved yet.
     pub(super) fn shown(&self) -> Option<Shown> {
-        match (&self.pane().listing, self.pane().file_path(), &self.pane().path) {
-            (Some(listing), ..) => Some(Shown::List(listing.of.clone())),
+        // The health page is a tool, not a place: back and forward pass it by.
+        if self.pane().health().is_some() {
+            return None;
+        }
+        match (self.pane().listing(), self.pane().file_path(), &self.pane().path) {
+            (Some(listing), ..) => Some(Shown::List(listing.of().to_path_buf())),
             (None, Some(file), _) => Some(Shown::File(file.clone())),
             (None, None, Some(note)) => Some(Shown::Note(note.clone())),
             (None, None, None) => None,
@@ -34,8 +38,8 @@ impl Shell {
         self.history.mark(&shown, place);
     }
 
-    /// The only place where history moves forward: at each render, what is shown is compared to
-    /// its current entry. A preview does not count; neither does going back or forward,
+    /// The only place where history moves forward: `sync_after_change` (never a frame) compares
+    /// what is shown to its current entry. A preview does not count; neither does going back or forward,
     /// since the current entry is then already what is shown.
     pub(super) fn track(&mut self, cx: &App) {
         if self.pane().peek {
@@ -89,9 +93,7 @@ impl Shell {
         {
             self.fresh_tab(window, cx);
         }
-        if self.nav.panel == nav::Panel::Full {
-            self.nav.panel = nav::Panel::Split;
-        }
+        self.nav.give_note_room();
         match entry.shown {
             Shown::List(of) => self.open_listing(of, window, cx),
             Shown::Note(path) => {

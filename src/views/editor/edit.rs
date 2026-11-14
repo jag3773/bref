@@ -6,13 +6,13 @@ use super::*;
 /// last is kept whole: each of the others only keeps what sets it
 /// apart from the next, i.e. a few bytes per keystroke rather than a copy of the note.
 #[derive(Default)]
-pub(super) struct History {
+pub(super) struct Snapshots {
     pub(super) last: Option<(String, Range<usize>)>,
     /// (start of the difference, its length in the next state, its text here, selection).
     pub(super) earlier: Vec<(usize, usize, String, Range<usize>)>,
 }
 
-impl History {
+impl Snapshots {
     pub(super) fn push(&mut self, text: String, sel: Range<usize>) {
         if let Some((old, old_sel)) = self.last.replace((text, sel)) {
             let new = self.last.as_ref().unwrap().0.as_bytes();
@@ -27,7 +27,7 @@ impl History {
                 tail -= 1;
             }
             self.earlier.push((start, new.len() - tail - start, old[start..old.len() - tail].to_string(), old_sel));
-            if self.earlier.len() >= 200 {
+            if self.earlier.len() >= crate::logic::undo::DEPTH {
                 self.earlier.remove(0);
             }
         }
@@ -55,7 +55,7 @@ impl Editor {
         if (boundary || stale) && !self.held {
             self.undo.push(self.content.clone(), self.sel.clone());
         }
-        self.redo = History::default();
+        self.redo = Snapshots::default();
         self.last_edit = Some(Instant::now());
     }
 
@@ -84,12 +84,23 @@ impl Editor {
         cx.notify();
     }
 
+    /// The one way to rewrite a block of the text, in the order the layout and the cursors need: the other
+    /// cursors follow through `map` (where a byte of the old text lands), the layout is told what moved,
+    /// the text is replaced, then the selection is `sel` (a collapsed one forgets which end was dragged).
+    /// The caller pushes the undo step first, unless the rewrite belongs to the one before (a realigned table).
+    pub(super) fn rewrite_block(&mut self, block: Range<usize>, new: &str, map: impl Fn(usize) -> usize, sel: Range<usize>, cx: &mut Context<Self>) {
+        self.follow(map);
+        self.damaged(&block);
+        self.content.replace_range(block, new);
+        self.reversed &= !sel.is_empty();
+        self.sel = sel;
+        self.changed(cx);
+    }
+
     /// Replaces `range` with `text`, keeping the selection as well as possible.
     pub(super) fn splice(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
         self.push_undo(text.contains('\n') || text == " ");
         let scopes = self.scopes_before(&range, text);
-        self.damaged(&range);
-        self.content.replace_range(range.clone(), text);
         let map = |p: usize| {
             if p <= range.start {
                 p
@@ -99,9 +110,8 @@ impl Editor {
                 range.start + text.len()
             }
         };
-        self.sel = map(self.sel.start)..map(self.sel.end);
-        self.follow(map);
-        self.changed(cx);
+        let sel = map(self.sel.start)..map(self.sel.end);
+        self.rewrite_block(range.clone(), text, map, sel, cx);
         if let Some((table, old)) = scopes {
             self.rename_scopes(table, old, cx);
         }
@@ -175,7 +185,15 @@ impl Editor {
         }
     }
 
-    pub fn restore(&mut self, redo: bool, cx: &mut Context<Self>) {
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        self.restore(false, cx)
+    }
+
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        self.restore(true, cx)
+    }
+
+    fn restore(&mut self, redo: bool, cx: &mut Context<Self>) {
         let (from, to) = if redo {
             (&mut self.redo, &mut self.undo)
         } else {
@@ -323,7 +341,7 @@ impl Editor {
         let total: isize = deltas.iter().sum();
         let old = self.content[block.clone()].to_string();
         // A byte keeps its place in its line; one in the removed indent goes to the line's start.
-        self.follow(|p| {
+        let map = |p: usize| {
             if p < block.start {
                 return p;
             }
@@ -334,13 +352,10 @@ impl Editor {
             let start = block.start + old.split('\n').take(l).map(|x| x.len() + 1).sum::<usize>();
             let shift: isize = deltas[..l].iter().sum();
             ((start as isize + shift) + ((p - start) as isize + deltas[l]).max(0)) as usize
-        });
-        self.damaged(&block);
-        self.content.replace_range(block.clone(), &shifted.join("\n"));
+        };
         let start = (sel.start as isize + deltas[0]).max(block.start as isize) as usize;
         let end = (sel.end as isize + total).max(start as isize) as usize;
-        self.sel = start..end;
-        self.changed(cx);
+        self.rewrite_block(block.clone(), &shifted.join("\n"), map, start..end, cx);
         self.renumber(cx);
     }
 

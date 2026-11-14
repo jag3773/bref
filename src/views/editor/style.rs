@@ -36,12 +36,9 @@ impl Editor {
         };
         let sel = moved(sel.start)..moved(sel.end);
         let shift = new.len() as isize - old.len() as isize;
-        self.follow(|p| if p > block.end { (p as isize + shift) as usize } else if p < block.start { p } else { moved(p) });
         self.push_undo(true);
-        self.damaged(&block);
-        self.content.replace_range(block, &new);
-        self.sel = sel;
-        self.changed(cx);
+        let map = |p: usize| if p > block.end { (p as isize + shift) as usize } else if p < block.start { p } else { moved(p) };
+        self.rewrite_block(block.clone(), &new, map, sel, cx);
         self.renumber(cx);
     }
 
@@ -140,6 +137,8 @@ impl Editor {
         while at <= sel.end {
             let lr = self.line_range(at);
             let line = &self.content[lr.clone()];
+            // The pairing of `markdown::walk` (a ``` opens a block only if another follows), kept inline
+            // because the walk starts at the selection, not at the top of the note.
             if md::is_fence(line) {
                 code = !code && self.content[lr.end..].lines().any(md::is_fence);
             } else if !code && self.is_table_line(&lr) {

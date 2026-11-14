@@ -15,7 +15,7 @@ fn failed_close_of_an_inactive_tab_shows_it_in_its_pane(cx: &mut TestAppContext)
     fs::write(&alpha, "# Alpha\n\noriginal").unwrap();
     fs::write(&beta, "# Beta\n").unwrap();
     open(&shell, cx, &alpha);
-    fs::create_dir(root.join(".Alpha.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Alpha.md"), true);
     cx.simulate_keystrokes("secondary-end");
     cx.simulate_input(" ajout");
     let (tab, editor) = shell.read_with(cx, |s, _| (s.active, s.pane().editor.clone()));
@@ -43,10 +43,9 @@ fn failed_close_of_an_inactive_tab_shows_it_in_its_pane(cx: &mut TestAppContext)
         assert_eq!(s.groups[s.group()].shown, s.active);
     });
     shell.update_in(cx, |_, window, cx| assert!(editor.focus_handle(cx).is_focused(window)));
-    fs::remove_dir(root.join(".Alpha.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Alpha.md"), false);
     cx.simulate_keystrokes("secondary-w");
     assert!(fs::read_to_string(alpha).unwrap().ends_with(" ajout"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[gpui::test]
@@ -82,18 +81,17 @@ fn failed_close_preserves_empty_files_drafts_and_title_renames(cx: &mut TestAppC
     fs::write(&link, "[[Alpha]]").unwrap();
     shell.update(cx, |s, cx| s.rescan(&root, cx));
     open(&shell, cx, &alpha);
-    fs::create_dir(root.join(".Renamed.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Renamed.md"), true);
     cx.simulate_keystrokes("secondary-a");
     cx.simulate_input("# Renamed\n\nchangé");
     cx.simulate_keystrokes("secondary-w");
     assert_eq!(fs::read_to_string(&alpha).unwrap(), "# Alpha\n\noriginal");
     assert_eq!(fs::read_to_string(&link).unwrap(), "[[Alpha]]");
     assert!(shell.read_with(cx, |s, _| s.pane().dirty && s.pane().path.as_ref() == Some(&alpha)));
-    fs::remove_dir(root.join(".Renamed.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Renamed.md"), false);
     cx.simulate_keystrokes("secondary-w secondary-alt-t");
     assert_eq!(shell.read_with(cx, |s, _| s.pane().path.clone()), Some(root.join("Renamed.md")));
     assert_eq!(fs::read_to_string(link).unwrap(), "[[Renamed]]");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[gpui::test]
@@ -107,8 +105,8 @@ fn failed_close_keeps_csv_and_tsv_edits_until_the_final_write(cx: &mut TestAppCo
         fs::write(&path, original).unwrap();
         open(&shell, cx, &path);
         let sheet = shell.read_with(cx, |s, _| s.shown_sheet().unwrap());
-        let block = root.join(format!(".{name}.tmp"));
-        fs::create_dir(&block).unwrap();
+        let block = root.join(name);
+        crate::platform::vault::refuse_writes(&block, true);
         // Close while a cell is still being typed: flush commits that input before saving.
         cx.simulate_input("modifié");
         cx.simulate_keystrokes("secondary-w");
@@ -117,15 +115,15 @@ fn failed_close_keeps_csv_and_tsv_edits_until_the_final_write(cx: &mut TestAppCo
         assert!(sheet.read_with(cx, |s, _| s.is_dirty() && s.table().row(0).join("|").contains("modifié")));
         assert!(shell.read_with(cx, |s, _| s.told(Tone::Failed, name)));
         // A background retry also fails without losing the data or the undo stack.
-        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.executor().advance_clock(SAVED);
         cx.run_until_parked();
         assert!(sheet.read_with(cx, |s, _| s.is_dirty()));
         cx.simulate_keystrokes("secondary-z secondary-shift-z");
         assert!(sheet.read_with(cx, |s, _| s.table().row(0).join("|").contains("modifié")));
-        fs::remove_dir(&block).unwrap();
+        crate::platform::vault::refuse_writes(&block, false);
         // Close with a scheduled background save still pending. The final write wins.
         cx.simulate_keystrokes("secondary-w");
-        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.executor().advance_clock(SAVED);
         cx.run_until_parked();
         assert!(fs::read_to_string(&path).unwrap().contains("modifié"));
         assert!(shell.read_with(cx, |s, _| s.panes.iter().all(|p| p.sheet() != Some(&sheet))));
@@ -133,7 +131,6 @@ fn failed_close_keeps_csv_and_tsv_edits_until_the_final_write(cx: &mut TestAppCo
         assert!(shell.read_with(cx, |s, cx| s.shown_sheet().unwrap().read(cx).table().row(0).join("|").contains("modifié")));
         cx.simulate_keystrokes("secondary-w");
     }
-    let _ = fs::remove_dir_all(root);
 }
 
 #[gpui::test]
@@ -147,7 +144,7 @@ fn failed_canvas_close_keeps_the_live_diagram_through_rescan(cx: &mut TestAppCon
     open(&shell, cx, &path);
     let canvas = shell.read_with(cx, |s, _| s.pane().drawing().cloned().unwrap());
     let original = fs::read_to_string(&path).unwrap();
-    fs::create_dir(root.join(".Drawing.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Drawing.svg"), true);
     cx.simulate_input("r");
     let (from, to) = canvas.read_with(cx, |c, _| (c.spot(0., 0.), c.spot(120., 60.)));
     cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::none());
@@ -162,11 +159,10 @@ fn failed_canvas_close_keeps_the_live_diagram_through_rescan(cx: &mut TestAppCon
     assert_eq!(canvas.read_with(cx, |c, _| c.diagram().shapes.len()), 1);
     cx.simulate_keystrokes("secondary-z secondary-shift-z");
     assert_eq!(canvas.read_with(cx, |c, _| c.diagram().shapes.len()), 1);
-    fs::remove_dir(root.join(".Drawing.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Drawing.svg"), false);
     cx.simulate_keystrokes("secondary-w secondary-alt-t");
     assert_eq!(Diagram::from_svg(&fs::read_to_string(path).unwrap()).unwrap().shapes.len(), 1);
     assert!(!shell.read_with(cx, |s, _| s.pane().canvas_dirty));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[gpui::test]
@@ -177,7 +173,7 @@ fn failed_close_button_and_window_close_keep_the_failed_document(cx: &mut TestAp
     fs::write(&alpha, "# Alpha\n").unwrap();
     fs::write(&beta, "# Beta\n").unwrap();
     open(&shell, cx, &alpha);
-    fs::create_dir(root.join(".Alpha.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Alpha.md"), true);
     cx.simulate_keystrokes("secondary-end");
     cx.simulate_input("à garder");
     let (tab, editor) = shell.read_with(cx, |s, _| (s.active, s.pane().editor.clone()));
@@ -205,10 +201,9 @@ fn failed_close_button_and_window_close_keep_the_failed_document(cx: &mut TestAp
     shell.update_in(cx, |s, window, cx| s.set_vault(other, window, cx));
     assert_eq!(shell.read_with(cx, |s, _| s.vault.clone()), Some(root.clone()));
     assert_eq!(shell.read_with(cx, |s, _| s.pane().editor.clone()), editor);
-    fs::remove_dir(root.join(".Alpha.tmp")).unwrap();
+    crate::platform::vault::refuse_writes(&root.join("Alpha.md"), false);
     assert!(cx.simulate_close());
     assert!(fs::read_to_string(alpha).unwrap().contains("à garder"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -244,5 +239,15 @@ fn failed_close_in_a_read_only_or_vanished_directory(cx: &mut TestAppContext) {
     fs::rename(&moved, &dir).unwrap();
     cx.simulate_keystrokes("secondary-w");
     assert_eq!(fs::read_to_string(path).unwrap(), "original changé");
-    let _ = fs::remove_dir_all(root);
+}
+
+#[gpui::test]
+fn failed_config_save_is_told(cx: &mut TestAppContext) {
+    let (_root, shell, cx, _config) = start(cx, "config-refused");
+    let settings = config::path(config::File::Settings);
+    crate::platform::vault::refuse_writes(&settings, true);
+    shell.update_in(cx, |s, window, cx| s.resize_text(Some(1.0), window, cx));
+    let told = shell.read_with(cx, |s, _| s.toasts.iter().any(|t| t.tone == Tone::Failed && t.text.contains("settings")));
+    crate::platform::vault::refuse_writes(&settings, false);
+    assert!(told);
 }

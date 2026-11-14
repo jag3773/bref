@@ -34,6 +34,7 @@ Every line of the help panel (`F1`), with the default keys of Linux and Windows.
 | `Ctrl+P › terminal` | Open a terminal in the vault |
 | `Ctrl+Shift+S` | Sync the vault with git: commit, receive, merge, send; a conflict keeps both versions as two notes |
 | `Ctrl+P › clone` | Clone a vault from a git address (also on the welcome screen) |
+| `Ctrl+P › health` | Vault health: broken links, orphans, unused pictures, empty notes, conflict copies, fixed in one click (nothing is deleted) |
 | A cloud folder | iCloud, Dropbox, Google Drive, Syncthing: put the vault there, nothing else; never a git repository inside one |
 | `Ctrl+Alt+E` | Share / Export: copy the whole note as Markdown or plain text, save a copy; SVG/PNG for diagrams, table formats |
 | `Ctrl+Shift+C` | Copy the code block, else the note |
@@ -158,6 +159,11 @@ Every line of the help panel (`F1`), with the default keys of Linux and Windows.
 | `Ctrl+V` | Table: paste cells from a spreadsheet, Markdown or CSV |
 | `Shift+Space` | Table: select the whole rows of the selection |
 | `Ctrl+Space` | Table: select the whole columns of the selection |
+| Edge of a header | Drag it to set the column's width, kept for the file; double-click fits the column to its text; Esc puts it back |
+| `Alt+.` | Table: widen the column |
+| `Alt+,` | Table: narrow the column |
+|  | Table: fit the column to its text |
+|  | Table: reset the column widths |
 | `Ctrl+Enter` | Table: insert a row below (a column to the right when whole columns are selected) |
 | `Ctrl+Shift+Enter` | Table: insert a row above (a column to the left when whole columns are selected) |
 | `Ctrl+Delete` | Table: remove the selected rows, or the columns when whole columns are selected |
@@ -169,6 +175,7 @@ Every line of the help panel (`F1`), with the default keys of Linux and Windows.
 
 | Keys | Action |
 |---|---|
+| `Ctrl+,` | Settings: every choice of the app, by section, in a tab |
 | `Ctrl+P › theme` | Theme, previewed as you browse |
 | `Ctrl+P › font` | Font of the app / of the code |
 | `Ctrl+P › page width` | Width of the text column: narrow, normal, wide, full |

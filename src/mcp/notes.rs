@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::{
     lang::{date_name, time_name},
     logic::{
-        daily, embed, markdown,
+        embed, markdown,
         embed::Anchor,
         markdown::Link,
         rank,
@@ -55,7 +55,7 @@ pub fn vault_info(vault: &Vault) -> Outcome {
         "diagram_version": crate::logic::diagram::VERSION,
         "unreadable": vault.unreadable.iter().map(|(path, kind)| json!({
             "path": vault::rel(&vault.root, path),
-            "error": disk(std::io::Error::new(*kind, "")),
+            "error": disk(std::io::Error::from(*kind)),
         })).collect::<Vec<_>>(),
     }))
 }
@@ -146,7 +146,7 @@ pub fn search_notes(vault: &Vault, args: &Value) -> Outcome {
     };
     let limit = arg_usize(args, "limit").unwrap_or(20).clamp(1, 50);
     let q = query.to_lowercase();
-    let words: Vec<&str> = q.split_whitespace().collect();
+    let words = rank::Words::of(&q);
     let mut scored = Vec::new();
     let mut named = vec![false; vault.notes.len()];
     for (i, note) in vault.notes.iter().enumerate() {
@@ -167,13 +167,12 @@ pub fn search_notes(vault: &Vault, args: &Value) -> Outcome {
         .map(|(_, i)| hit(vault, &vault.notes[i], "name", ""))
         .collect();
     if hits.len() < limit && q.chars().count() >= 2 {
-        let word = words.first().copied().unwrap_or(q.as_str());
         for (i, note) in vault.notes.iter().enumerate() {
             if named[i] || vault.is_template(note) || !kept(vault, &note.path, &note.tags, args) {
                 continue;
             }
-            if rank::contains_all(&note.lower, &words) {
-                hits.push(hit(vault, note, "text", &rank::snippet(&note.body, &note.lower, word)));
+            if words.all_in(&note.body) {
+                hits.push(hit(vault, note, "text", &words.snippet(&note.body)));
                 if hits.len() == limit {
                     break;
                 }
@@ -242,18 +241,10 @@ fn section_text(text: &str, section: &str) -> Result<String, String> {
 fn outgoing(vault: &Vault, text: &str) -> Vec<Value> {
     let mut found = Vec::new();
     let mut seen = Vec::new();
-    let mut in_code = false;
-    for (row, line) in text.lines().enumerate() {
-        if markdown::is_fence(line) {
-            in_code = !in_code;
-            continue;
-        }
-        if in_code {
-            continue;
-        }
-        for (_, link) in markdown::links(line) {
+    for (row, line) in markdown::walk(text).enumerate().filter(|(_, l)| l.outside()) {
+        for (_, link) in markdown::links(line.text) {
             let Link::Wiki(name) = link else { continue };
-            let target = name.split(['#', '|']).next().unwrap_or(&name).trim().to_string();
+            let target = name;
             if target.is_empty() || seen.contains(&target.to_lowercase()) {
                 continue;
             }
@@ -290,7 +281,7 @@ fn embeds(vault: &Vault, text: &str) -> Vec<Value> {
 fn comments_of(text: &str) -> Vec<Value> {
     markdown::all_comments(text)
         .into_iter()
-        .map(|note| json!({"passage": note.noted, "comment": note.said, "scope": note.scope}))
+        .map(|note| json!({"passage": note.noted, "comment": note.said, "scope": note.scope.map(|s| s.to_string()).unwrap_or_default()}))
         .collect()
 }
 
@@ -364,7 +355,7 @@ pub fn create_note(vault: &mut Vault, args: &Value) -> Outcome {
         };
         markdown::fill(&text, &name, &date_name(clock::today()), &time_name(clock::clock())).0
     } else {
-        let mut body = format!("# {name}\n\n");
+        let mut body = files::new_note_text(&name);
         if let Some(text) = arg_opt(args, "text") {
             body.push_str(text.trim_start_matches('\n'));
             if !body.ends_with('\n') {
@@ -426,7 +417,11 @@ pub fn edit_note(vault: &mut Vault, args: &Value) -> Outcome {
     if let Err(message) = files::write(&path, &next).map_err(disk) {
         return Outcome::err(message);
     }
-    let (path, renamed, reason, rewritten) = follow_title(vault, &path, &text, &next);
+    let (path, renamed, reason, (rewritten, relink_errors)) = follow_title(vault, &path, &text, &next);
+    // A renamed heading is followed by the links that point at it, as in the app.
+    if let Some((was, now)) = embed::renamed_heading(&text, &next) {
+        files::follow_heading(Some(&vault.root), &mut vault.notes, &path, &was, &now);
+    }
     let revision = vault::revision(next.as_bytes());
     Outcome::ok(json!({
         "path": vault::rel(&vault.root, &path),
@@ -434,34 +429,34 @@ pub fn edit_note(vault: &mut Vault, args: &Value) -> Outcome {
         "renamed": renamed,
         "name_kept": reason,
         "rewritten": rewritten,
+        "relink_errors": relink_errors,
     }))
 }
 
 /// A changed `# title` renames the file and the links, unless the new name is taken:
 /// the text is kept and the file keeps its name, as the app does.
-fn follow_title(vault: &mut Vault, path: &Path, before: &str, after: &str) -> (std::path::PathBuf, bool, Option<String>, usize) {
+fn follow_title(vault: &mut Vault, path: &Path, before: &str, after: &str) -> (std::path::PathBuf, bool, Option<String>, (usize, usize)) {
     let was = files::h1_of(before);
     let now = files::h1_of(after);
     let Some(title) = now.filter(|title| was.as_ref() != Some(title)) else {
         vault.rescan();
-        return (path.to_path_buf(), false, None, 0);
+        return (path.to_path_buf(), false, None, (0, 0));
     };
     let old = files::stem(path);
-    if title == old {
+    let Some(dest) = files::title_rename(path, &title, true) else {
         vault.rescan();
-        return (path.to_path_buf(), false, None, 0);
-    }
-    let dest = path.with_file_name(format!("{title}.md"));
-    if dest.exists() {
+        return (path.to_path_buf(), false, None, (0, 0));
+    };
+    if files::taken_by_other(path, &dest) {
         vault.rescan();
-        return (path.to_path_buf(), false, Some("this name is already taken".into()), 0);
+        return (path.to_path_buf(), false, Some("this name is already taken".into()), (0, 0));
     }
     if let Err(error) = files::rename(path, &dest) {
         vault.rescan();
-        return (path.to_path_buf(), false, Some(disk(error)), 0);
+        return (path.to_path_buf(), false, Some(disk(error)), (0, 0));
     }
-    let rewritten = vault::relink(vault, &old, &title);
-    (dest, true, None, rewritten)
+    let _ = files::relocate_icons(&vault.root, path, &dest); // ponytail: a failed icon save is not worth undoing the rename
+    (dest, true, None, vault::relink(vault, &old, &title))
 }
 
 pub fn append_to_note(vault: &mut Vault, args: &Value) -> Outcome {
@@ -539,15 +534,19 @@ pub fn rename_note(vault: &mut Vault, args: &Value) -> Outcome {
     let path = path;
     let old_file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let old_stem = files::stem(&path);
-    let image = files::is_image(&path) || files::is_attachment(&path) || vault.diagrams.iter().any(|p| p == &path);
+    let image = files::is_image(&path) || files::is_table(&path) || files::is_attachment(&path) || vault.diagrams.iter().any(|p| p == &path);
     let name = arg_opt(args, "name").map(|n| n.to_string());
     let folder = arg_opt(args, "folder").map(|n| n.to_string());
     if name.is_none() && folder.is_none() {
         return Outcome::err("`name` or `folder` is missing");
     }
-    let dir = match place(vault, folder.as_deref()) {
-        Ok(dir) => dir,
-        Err(outcome) => return outcome,
+    // Without a folder the file stays where it is, as in the app.
+    let dir = match folder.as_deref() {
+        None => path.parent().map(Path::to_path_buf).unwrap_or_else(|| vault.root.clone()),
+        Some(_) => match place(vault, folder.as_deref()) {
+            Ok(dir) => dir,
+            Err(outcome) => return outcome,
+        },
     };
     if let Err(message) = fs::create_dir_all(&dir).map_err(disk) {
         return Outcome::err(message);
@@ -571,7 +570,7 @@ pub fn rename_note(vault: &mut Vault, args: &Value) -> Outcome {
         old_file.clone()
     };
     let dest = dir.join(&file_name);
-    if dest != path && dest.exists() {
+    if dest != path && files::taken_by_other(&path, &dest) {
         return Outcome::err(format!("a file already has the name `{}` ({})", files::stem(&dest), vault::rel(&vault.root, &dest)));
     }
     if dest != path
@@ -585,26 +584,26 @@ pub fn rename_note(vault: &mut Vault, args: &Value) -> Outcome {
     } else {
         (old_stem.clone(), new_stem.clone())
     };
-    // A note whose title was its name keeps the title in step.
-    if dest.extension().is_some_and(|e| e == "md") && old_stem != new_stem {
-        if let Ok(text) = fs::read_to_string(&dest)
-            && files::h1_of(&text).as_deref() == Some(old_stem.as_str())
-        {
-            let meta = markdown::front_matter(&text);
-            let (head, body) = text.split_at(meta);
-            if let Some(first) = body.lines().find(|l| !l.trim().is_empty()) {
-                let hashes = first.trim_start().chars().take_while(|c| *c == '#').count();
-                let title = format!("{} {new_stem}", "#".repeat(hashes.max(1)));
-                let _ = files::write(&dest, &format!("{head}{}", body.replacen(first, &title, 1)));
-            }
+    // A note whose title was its name keeps the title in step; if that fails, nothing changed.
+    if dest.extension().is_some_and(|e| e == "md")
+        && old_stem != new_stem
+        && let Err(error) = files::retitle(&dest, &old_stem, &new_stem)
+    {
+        if dest != path {
+            files::rename(&dest, &path).ok();
         }
+        vault.rescan();
+        return Outcome::err(disk(error));
     }
-    let rewritten = if old_link != new_link { vault::relink(vault, &old_link, &new_link) } else { vault.rescan(); 0 };
+    let icons = if dest != path { files::relocate_icons(&vault.root, &path, &dest).err().map(disk) } else { None };
+    let (rewritten, relink_errors) = if old_link != new_link { vault::relink(vault, &old_link, &new_link) } else { vault.rescan(); (0, 0) };
     let left = old_link != new_link && rewritten == 0 && vault.notes.iter().any(|n| n.name.eq_ignore_ascii_case(&old_link));
     Outcome::ok(json!({
         "path": vault::rel(&vault.root, &dest),
         "rewritten": rewritten,
         "links_left": left,
+        "relink_errors": relink_errors,
+        "icons_error": icons,
     }))
 }
 
@@ -682,11 +681,11 @@ pub fn daily_note(vault: &mut Vault, args: &Value) -> Outcome {
                 };
                 markdown::fill(&text, &name, &name, &time_name(clock::clock())).0
             }
-            None => format!("# {name}\n\n"),
+            None => files::new_note_text(&name),
         };
         let path = vault.root.join(format!("{name}.md"));
-        if path.exists() {
-            return Outcome::err(format!("a note already has the name `{name}` ({})", vault::rel(&vault.root, &path)));
+        if let Some(taken) = vault::name_taken(&vault.root, &name, "md") {
+            return Outcome::err(format!("a note already has the name `{name}` ({})", vault::rel(&vault.root, &taken)));
         }
         if let Err(message) = files::write(&path, &body).map_err(disk) {
             return Outcome::err(message);
@@ -707,7 +706,7 @@ fn parse_date(text: &str) -> Result<(i32, u32, u32), String> {
     match (year, month, day, parts.next()) {
         // A day the calendar has comes back unchanged from a day number: 2026-02-30 does not.
         (Some(year), Some(month), Some(day), None)
-            if (1..=12).contains(&month) && markdown::day_of(markdown::day_number((year, month, day))) == (year, month, day) =>
+            if (1..=12).contains(&month) && crate::logic::dates::day_of(crate::logic::dates::day_number((year, month, day))) == (year, month, day) =>
         {
             Ok((year, month, day))
         }
@@ -716,13 +715,7 @@ fn parse_date(text: &str) -> Result<(i32, u32, u32), String> {
 }
 
 fn daily_template(vault: &Vault) -> Option<std::path::PathBuf> {
-    let named: Vec<(std::path::PathBuf, String)> = vault
-        .notes
-        .iter()
-        .filter(|n| vault.is_template(n))
-        .map(|n| (n.path.clone(), n.name.clone()))
-        .collect();
-    daily::pick(named.iter().map(|(path, stem)| (path.clone(), stem.as_str())))
+    files::daily_template(vault.notes.iter().filter(|n| vault.is_template(n)).map(|n| n.path.clone()))
 }
 
 pub fn add_comment(vault: &mut Vault, args: &Value) -> Outcome {
@@ -778,15 +771,7 @@ fn comment_on(text: &str, passage: &str, comment: &str) -> Result<String, String
     let line_end = text[*start..].find('\n').map(|i| *start + i).unwrap_or(text.len());
     let in_cell = *start + passage.len() <= line_end && markdown::is_table_line(&text[line_start..line_end]);
     let said = if in_cell { comment.replace('|', "\\|") } else { comment.to_string() };
-    let mut out = String::with_capacity(text.len() + said.len() + 12);
-    out.push_str(&text[..*start]);
-    out.push_str("{==");
-    out.push_str(passage);
-    out.push_str("==}{>>");
-    out.push_str(&said);
-    out.push_str("<<}");
-    out.push_str(&text[*start + passage.len()..]);
-    Ok(out)
+    Ok(format!("{}{}{}", &text[..*start], markdown::comment_on(passage, &said), &text[*start + passage.len()..]))
 }
 
 fn vault_note(vault: &Vault, args: &Value) -> Result<std::path::PathBuf, Outcome> {

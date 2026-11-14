@@ -55,7 +55,7 @@ use gpui::{
     ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, Font, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image,
     ImageFormat, ImgResourceLoader, InspectorElementId, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, Resource, Rgba, ScrollWheelEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, Resource, ScrollWheelEvent,
     SharedString, Size, StrikethroughStyle, Style, TextAlign, TextRun, TransformationMatrix,
     UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, font, point,
     prelude::*, px, quad, relative, size,
@@ -64,7 +64,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     ui::theme::Wide,
-    ui::theme::Theme, logic::block, logic::diagram::Diagram, ui::figure, views::graph, views::viewer::Source, ui::svg, ui::assets::mono, ui::assets::sans, lang::tr, platform::vault,
+    ui::theme::Theme, logic::block, logic::diagram::Diagram, ui::figure, views::graph, views::viewer::Source, ui::svg, lang::tr, platform::vault,
     logic::markdown::{self as md, Enter, Kind, Link, ListStyle},
 };
 
@@ -198,6 +198,38 @@ const BROKEN: Pixels = px(20.);
 // not followed; allow the link's target if someone needs it.
 /// The picture file written `path` in a note: in the note's folder, at the vault root (the last of
 /// `dirs`), then by its name anywhere in the vault (`images`); never outside the vault.
+/// Whether the line starting at `line_start` is inside a code block, or is the one that closes it
+/// (the state *before* the line, which is why it differs from `markdown::walk` on a closing fence:
+/// `walk` marks fences themselves as not code). On every other line the two agree, and a ``` without a
+/// closing fence opens no block for either (`editor_and_walk_agree_on_fences`). Pairing is
+/// done by parity, without walking the text: the editor asks it for one line at a time.
+fn in_code_at(content: &str, line_start: usize) -> bool {
+    content[..line_start].lines().filter(|l| md::is_fence(l)).count() % 2 == 1 && content[line_start..].lines().any(md::is_fence)
+}
+
+/// Test: set by the hand-run benchmarks, which measure the reuse instead of checking it.
+#[cfg(test)]
+pub static MEASURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the editors look names up in, built once per change of the vault and shared (`Rc`) by
+/// every tab and embed.
+#[derive(Default)]
+pub struct VaultLookups {
+    /// Names of the notes and their aliases, to complete `[[wikilinks]]`.
+    pub notes: Vec<String>,
+    /// Vault images by file name (lowercase): wherever they are stored, a note finds them.
+    pub images: HashMap<String, PathBuf>,
+    /// Notes and aliases (lowercase) → file, for the sections embedded from them.
+    pub sources: HashMap<String, PathBuf>,
+}
+
+impl VaultLookups {
+    pub fn new(notes: Vec<String>, images: &[PathBuf], sources: HashMap<String, PathBuf>) -> Self {
+        let images = images.iter().map(|p| (graph::image_name(p).to_lowercase(), p.clone())).collect();
+        Self { notes, images, sources }
+    }
+}
+
 pub fn find_picture(dirs: &[PathBuf], images: &HashMap<String, PathBuf>, path: &str) -> Option<PathBuf> {
     let root = dirs.last();
     let found = dirs.iter().map(|d| d.join(path)).find(|p| p.is_file() && root.is_some_and(|r| inside(r, p)));
@@ -217,7 +249,7 @@ pub enum EditorEvent {
     /// The same, with Shift: to open in the other pane.
     OpenAside(Link),
     /// Replace across the whole vault what the search bar looks for.
-    Swap(md::Swap),
+    Swap(crate::logic::search::Swap),
     /// Right click in the note: where, the link found there, whether it targets a comment, and whether the keys opened it.
     Menu(Point<Pixels>, Option<Link>, bool, bool),
     /// Click on a block handle: its menu, at that spot.
@@ -226,10 +258,33 @@ pub enum EditorEvent {
     View(Source),
     /// An embedded section, or a link to a heading, to open: the note and where in it; with Shift, aside.
     OpenAt(crate::logic::embed::Target, bool),
+    /// Something the user asked for did not happen (a pasted picture that could not be saved): the shell tells them.
+    Failed(String),
 }
 
 /// What the footer counter depends on: the text version and the selection.
 type CountKey = (u64, Option<Range<usize>>);
+
+/// What the window around the note asks of it, set by the shell through `Editor::set_chrome`
+/// (never written field by field, and only when it changes).
+#[derive(Clone, Copy, PartialEq)]
+pub struct Chrome {
+    /// Number of buttons the window puts in the corner, right of the counter.
+    pub corner: usize,
+    /// The note is the active pane's: a single formatting bar for the whole window.
+    pub bar_here: bool,
+    /// Left edge (in the window) of the window buttons floating over the top right corner, where the app draws them:
+    /// a first line reaching under it starts lower (`place`).
+    pub pill: Option<Pixels>,
+    /// Top room kept free for the shell's window handle: the text never starts above it.
+    pub strip: Pixels,
+}
+
+impl Default for Chrome {
+    fn default() -> Self {
+        Chrome { corner: 1, bar_here: true, pill: None, strip: px(0.) }
+    }
+}
 
 pub struct Editor {
     focus: FocusHandle,
@@ -247,17 +302,15 @@ pub struct Editor {
     /// dragging extends it word by word or line by line.
     anchor: Option<(Range<usize>, bool)>,
     goal_x: Option<Pixels>,
-    undo: History,
-    redo: History,
+    undo: Snapshots,
+    redo: Snapshots,
     last_edit: Option<Instant>,
     /// Where the last change started (`usize::MAX` after a load or an undo): the ``` there is the one being typed.
     edited_at: usize,
-    notes: Rc<[String]>,
+    /// Notes, pictures and embed sources of the vault: one value shared by every tab and embed.
+    vault: Rc<VaultLookups>,
     /// Folders to look for images in: the note's, then the vault.
     dirs: Vec<PathBuf>,
-    /// Vault images by file name (lowercase): wherever they are
-    /// stored, a note finds them.
-    images: HashMap<String, PathBuf>,
     /// Start of the line whose code block was just copied.
     copied: Option<usize>,
     /// Start of the line whose copy button is hovered.
@@ -341,19 +394,12 @@ pub struct Editor {
     /// Footer counter, kept as long as the text and the selection do not move.
     counted: Option<(CountKey, String)>,
     /// The text counted last, its version and its counts: on a keystroke, only the changed
-    /// lines are recounted (`md::recount`).
+    /// lines are recounted (`crate::logic::search::recount`).
     tally: Option<(u64, String, (usize, usize))>,
-    /// Number of buttons the window puts in the corner, right of the counter.
-    pub corner: usize,
+    /// What the shell's window chrome asks of the note (see `Chrome`).
+    chrome: Chrome,
     /// The formatting bar: what it offers, where it sits, folded or open.
     bar: BarState,
-    /// The note is the active pane's: a single formatting bar for the whole window.
-    pub bar_here: bool,
-    /// Left edge (in the window) of the window buttons floating over the top right corner, where the app draws them:
-    /// a first line reaching under it starts lower (`place`).
-    pub pill: Option<Pixels>,
-    /// Top room kept free for the shell's window handle: the text never starts above it.
-    pub strip: Pixels,
     /// Top margin of the text in the last `place`: `TOP`, or `PILL_CLEAR`.
     top: Pixels,
     /// Changes when everything must be redone (other note, theme, images): nothing is reused.
@@ -402,6 +448,18 @@ impl Focusable for Editor {
 }
 
 impl Editor {
+    #[cfg(test)]
+    pub fn chrome(&self) -> Chrome {
+        self.chrome
+    }
+
+    /// Takes the window chrome; nothing happens when it is the one already held.
+    pub fn set_chrome(&mut self, chrome: Chrome) {
+        if self.chrome != chrome {
+            self.chrome = chrome;
+        }
+    }
+
     pub fn new(theme: Theme, cx: &mut Context<Self>) -> Self {
         Self {
             focus: cx.focus_handle(),
@@ -414,13 +472,12 @@ impl Editor {
             selecting: false,
             anchor: None,
             goal_x: None,
-            undo: History::default(),
-            redo: History::default(),
+            undo: Snapshots::default(),
+            redo: Snapshots::default(),
             last_edit: None,
             edited_at: usize::MAX,
-            notes: Rc::from([]),
+            vault: Rc::default(),
             dirs: Vec::new(),
-            images: HashMap::new(),
             copied: None,
             hover: None,
             view_hover: None,
@@ -464,18 +521,15 @@ impl Editor {
             rows_revision: 0,
             counted: None,
             tally: None,
-            corner: 1,
+            chrome: Chrome::default(),
             bar: BarState::default(),
-            bar_here: true,
-            pill: None,
-            strip: px(0.),
             top: TOP,
             epoch: 0,
             dmg: None,
             laid: None,
             force_full: false,
             #[cfg(test)]
-            compare: std::env::var("BREF_NO_COMPARE").is_err(),
+            compare: !MEASURING.load(std::sync::atomic::Ordering::Relaxed),
             #[cfg(test)]
             counts: (0, 0, 0),
             laid_out: None,
@@ -512,8 +566,8 @@ impl Editor {
         self.reversed = false;
         self.more.clear();
         self.marked = None;
-        self.undo = History::default();
-        self.redo = History::default();
+        self.undo = Snapshots::default();
+        self.redo = Snapshots::default();
         self.last_edit = None;
         self.edited_at = usize::MAX;
         self.scroll_y = px(0.);
@@ -542,23 +596,21 @@ impl Editor {
         self.epoch += 1;
     }
 
-    /// Names of the vault's notes, to complete `[[wikilinks]]`.
-    /// Shared by every editor of the window: one list, however many tabs are open.
-    pub fn set_notes(&mut self, notes: Rc<[String]>) {
-        self.notes = notes;
-    }
-
-    pub fn set_images(&mut self, images: &[PathBuf]) {
-        let named = images.iter().map(|p| (graph::image_name(p).to_lowercase(), p.clone()));
-        self.images = named.collect();
+    /// Tells the editor what the vault holds (see `VaultLookups`) and the name of the note it shows,
+    /// which an embed may not lead back to.
+    pub fn set_vault(&mut self, vault: Rc<VaultLookups>, me: Option<String>) {
+        self.vault = vault;
+        self.embeds.trail = me.into_iter().map(|m| m.to_lowercase()).collect();
+        self.embeds.recheck = true;
         self.version += 1;
         self.epoch += 1;
+        self.laid_out = None;
     }
 
     /// What the note's pictures and embeds are looked up in: its folders, the vault's pictures by
     /// name, its notes by name (see `find_picture`).
     pub fn lookups(&self) -> (Vec<PathBuf>, HashMap<String, PathBuf>, HashMap<String, PathBuf>) {
-        (self.dirs.clone(), self.images.clone(), (*self.embeds.sources).clone())
+        (self.dirs.clone(), self.vault.images.clone(), self.vault.sources.clone())
     }
 
     pub fn set_dirs(&mut self, dirs: Vec<PathBuf>) {
@@ -620,19 +672,19 @@ impl Editor {
         if let Some((_, label)) = self.counted.as_ref().filter(|(known, _)| *known == key) {
             return label.clone();
         }
-        let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let plural = |n: usize, one, many| format!("{n} {}", crate::lang::plural(n, one, many));
         let both = |(words, chars): (usize, usize)| {
             format!(
                 "{} · {}",
-                plural(words, tr("word", "mot"), tr("words", "mots")),
-                plural(chars, tr("character", "caractère"), tr("characters", "caractères"))
+                plural(words, ("word", "mot"), ("words", "mots")),
+                plural(chars, ("character", "caractère"), ("characters", "caractères"))
             )
         };
         let label = if self.sel.is_empty() {
             let whole = match &self.tally {
                 Some((version, _, whole)) if *version == self.version => *whole,
-                Some((_, old, was)) => md::recount(old, *was, &self.content),
-                None => md::counts(&self.content),
+                Some((_, old, was)) => crate::logic::search::recount(old, *was, &self.content),
+                None => crate::logic::search::counts(&self.content),
             };
             if self.tally.as_ref().is_none_or(|(version, ..)| *version != self.version) {
                 // ponytail: a copy of the text for the next recount; keep the counts in `splice` if it weighs.
@@ -640,7 +692,7 @@ impl Editor {
             }
             both(whole)
         } else {
-            format!("{} {}", tr("Selection:", "Sélection :"), both(md::counts(&self.content[self.sel.clone()])))
+            format!("{} {}", tr("Selection:", "Sélection :"), both(crate::logic::search::counts(&self.content[self.sel.clone()])))
         };
         self.counted = Some((key, label.clone()));
         label
@@ -717,10 +769,9 @@ impl Editor {
         self.content[..at].lines().filter(|l| md::is_fence(l)).count()
     }
 
-    /// A ``` without a closing fence does not open a block, as in `layout`.
+    /// Whether the line starting at `line_start` is inside a code block, or is the one that closes it.
     fn in_code(&self, line_start: usize) -> bool {
-        self.fences_before(line_start) % 2 == 1
-            && self.content[line_start..].lines().any(md::is_fence)
+        in_code_at(&self.content, line_start)
     }
 
     // ----- Search in the note -----
@@ -778,7 +829,7 @@ mod tests {
     #[test]
     fn history_returns_each_state() {
         let states = ["", "é", "éa", "éa\nligne", "a\nligne", "a\nligné"];
-        let mut history = History::default();
+        let mut history = Snapshots::default();
         for (i, state) in states.iter().enumerate() {
             history.push(state.to_string(), i..i);
         }
@@ -805,4 +856,38 @@ mod tests {
         assert_eq!(table_lead(Wide::Column, px(952.), text), px(0.));
     }
 
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    /// The editor's idea of "inside a code block" and `markdown::walk`'s agree, whatever the fences:
+    /// closed blocks, a stray ``` at the end or in the middle, empty blocks, fences with a language.
+    #[test]
+    fn editor_and_walk_agree_on_fences() {
+        let layouts = [
+            "a\n```\nb\n```\nc",
+            "a\n```\nb",
+            "```\nb\n```\n```\nc",
+            "```\na\n```\n```\nb\n```\n```\nc\nd",
+            "```\n```\ntext\n```",
+            "x\n```rust\nfn a() {}\n```\ny\n```mermaid\ngraph TD\n",
+            "```",
+            "",
+            "t\n\n```\n\n```\n\nu\n",
+            "```\na\n```\n```\n```\nb",
+        ];
+        for text in layouts {
+            let mut inside_before = false;
+            for line in md::walk(text) {
+                if !line.fence {
+                    assert_eq!(in_code_at(text, line.at), line.code, "{text:?}, line at {}", line.at);
+                } else if inside_before {
+                    assert!(in_code_at(text, line.at), "closing fence of {text:?} at {}", line.at);
+                }
+                inside_before = line.code;
+            }
+        }
+    }
 }

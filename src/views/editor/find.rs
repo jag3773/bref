@@ -5,7 +5,7 @@ use crate::views::field::{Field, FieldEvent};
 
 /// What the matches were found for: the text's version, the search, case, whole words, regular expression, and
 /// the lines it keeps to.
-type Asked = (u64, String, bool, bool, bool, Option<Range<usize>>);
+type Asked = (u64, String, crate::logic::search::FindOptions, Option<Range<usize>>);
 
 /// Find in the note: its two fields, its settings and the matches found. Kept when the bar closes:
 /// it opens again on the same search.
@@ -14,10 +14,7 @@ pub(super) struct Finder {
     pub(super) with: Entity<Field>,
     /// The "Replace" line shows.
     pub(super) replace: bool,
-    pub(super) case: bool,
-    pub(super) word: bool,
-    /// The search is a regular expression.
-    pub(super) regex: bool,
+    pub(super) options: crate::logic::search::FindOptions,
     /// The lines selected when the bar opened, when there were several; `inside`: the search keeps to them.
     pub(super) span: Option<Range<usize>>,
     pub(super) inside: bool,
@@ -31,13 +28,13 @@ pub(super) struct Finder {
 
 impl Finder {
     pub(super) fn query(&self, cx: &App) -> String {
-        self.query.read(cx).line.text.clone()
+        self.query.read(cx).text().to_string()
     }
 
     /// The field that takes the keys: the replacement when it shows and the search is settled (`ready`: the bar
     /// was open, or the selection made it), otherwise the search.
     fn aim(&self, ready: bool, cx: &App) -> FocusHandle {
-        let to = if self.replace && ready && !self.query.read(cx).line.text.is_empty() { &self.with } else { &self.query };
+        let to = if self.replace && ready && !self.query.read(cx).text().is_empty() { &self.with } else { &self.query };
         to.focus_handle(cx)
     }
 
@@ -69,22 +66,22 @@ impl Editor {
     }
 
     /// The bar's search, open or kept: what the vault search starts from.
-    pub fn search(&self, cx: &App) -> Option<md::Swap> {
+    pub fn search(&self, cx: &App) -> Option<crate::logic::search::Swap> {
         let find = self.find.as_ref().or(self.found.as_ref())?;
-        let with = find.with.read(cx).line.text.clone();
-        Some(md::Swap { query: find.query(cx), with, case: find.case, word: find.word, regex: find.regex })
+        let with = find.with.read(cx).text().to_string();
+        Some(crate::logic::search::Swap { query: find.query(cx), with, options: find.options })
     }
 
     /// A result of the vault search: the bar opens on its search, the current match the one at byte `at`, and
     /// the note has the keys.
-    pub fn show_match(&mut self, swap: &md::Swap, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn show_match(&mut self, swap: &crate::logic::search::Swap, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         let mut find = match self.find.take().or_else(|| self.found.take()) {
             Some(find) => find,
             None => self.new_finder(window, cx),
         };
         find.query.update(cx, |field, cx| field.set(&swap.query, cx));
         find.with.update(cx, |field, cx| field.set(&swap.with, cx));
-        (find.case, find.word, find.regex, find.span, find.inside, find.key) = (swap.case, swap.word, swap.regex, None, false, None);
+        (find.options, find.span, find.inside, find.key) = (swap.options, None, false, None);
         self.find = Some(find);
         self.sel = at.min(self.content.len())..at.min(self.content.len());
         self.find_changed(cx);
@@ -105,7 +102,7 @@ impl Editor {
             }
         };
         let fields = [cx.subscribe_in(&query, window, on(false)), cx.subscribe_in(&with, window, on(true))];
-        Finder { query, with, replace: false, case: false, word: false, regex: false, span: None, inside: false, hits: Vec::new(), at: 0, key: None, _fields: fields }
+        Finder { query, with, replace: false, options: crate::logic::search::FindOptions::default(), span: None, inside: false, hits: Vec::new(), at: 0, key: None, _fields: fields }
     }
 
     /// Ctrl+F opens the bar on the search, Ctrl+R with the replace line and the keys in it; pressed with the bar
@@ -122,11 +119,11 @@ impl Editor {
             Some((_, text)) if !text.contains('\n') => find.query.update(cx, |field, cx| field.set(&text, cx)),
             Some((range, _)) => (find.span, find.inside) = (Some(range), true),
             // Opened again on the same search: all selected, typing replaces it.
-            None if !was_open => find.query.update(cx, |field, cx| field.set(&field.line.text.clone(), cx)),
+            None if !was_open => find.query.update(cx, |field, cx| field.select_all(cx)),
             None => {}
         }
         if !was_open {
-            find.with.update(cx, |field, cx| field.set(&field.line.text.clone(), cx));
+            find.with.update(cx, |field, cx| field.select_all(cx));
         }
         find.replace = replace;
         window.focus(&find.aim(was_open || picked_any, cx));
@@ -167,12 +164,12 @@ impl Editor {
             return false;
         };
         let (query, scope) = (find.query(cx), find.scope(len));
-        let key = (version, query.clone(), find.case, find.word, find.regex, scope.clone());
+        let key = (version, query.clone(), find.options, scope.clone());
         if find.key.as_ref() == Some(&key) {
             return false;
         }
         let inside = |hit: &Range<usize>| scope.as_ref().is_none_or(|scope| scope.start <= hit.start && hit.end <= scope.end);
-        find.hits = md::replacements(&self.content, &query, "", find.case, find.word, find.regex).into_iter().map(|(hit, _)| hit).filter(inside).collect();
+        find.hits = crate::logic::search::replacements(&self.content, &query, "", find.options).into_iter().map(|(hit, _)| hit).filter(inside).collect();
         find.at = find.hits.iter().position(|hit| hit.start >= from).unwrap_or(0);
         find.key = Some(key);
         true
@@ -209,10 +206,10 @@ impl Editor {
     /// The matches found and what replaces each; `None` without a "Replace" line.
     pub(super) fn replacements(&self, cx: &App) -> Option<Vec<(Range<usize>, String)>> {
         let find = self.find.as_ref().filter(|find| find.replace)?;
-        let with = find.with.read(cx).line.text.clone();
+        let with = find.with.read(cx).text().to_string();
         let scope = find.scope(self.content.len());
         let inside = |(hit, _): &(Range<usize>, String)| scope.as_ref().is_none_or(|scope| scope.start <= hit.start && hit.end <= scope.end);
-        Some(md::replacements(&self.content, &find.query(cx), &with, find.case, find.word, find.regex).into_iter().filter(inside).collect())
+        Some(crate::logic::search::replacements(&self.content, &find.query(cx), &with, find.options).into_iter().filter(inside).collect())
     }
 
     /// The selected lines the search keeps to grow or shrink with what replaced a match in them.
@@ -241,9 +238,9 @@ impl Editor {
     /// the bar's settings.
     pub(super) fn replace_in_vault(&mut self, cx: &mut Context<Self>) {
         let Some(find) = self.find.as_ref().filter(|find| find.replace) else { return };
-        let (query, with) = (find.query(cx), find.with.read(cx).line.text.clone());
+        let (query, with) = (find.query(cx), find.with.read(cx).text().to_string());
         if !query.is_empty() {
-            cx.emit(EditorEvent::Swap(md::Swap { query, with, case: find.case, word: find.word, regex: find.regex }));
+            cx.emit(EditorEvent::Swap(crate::logic::search::Swap { query, with, options: find.options }));
         }
     }
 
@@ -281,15 +278,18 @@ impl Editor {
         if self.refresh_find(cx) { self.show_hit(cx) } else { cx.notify() }
     }
 
-    /// One of the search's settings switched: case, whole words, regular expression, in the selection.
-    pub(super) fn find_flip(&mut self, which: usize, cx: &mut Context<Self>) {
+    /// One of the search's settings switched: case, whole words, regular expression.
+    pub(super) fn find_flip(&mut self, option: crate::logic::search::FindOption, cx: &mut Context<Self>) {
         if let Some(find) = &mut self.find {
-            match which {
-                0 => find.case ^= true,
-                1 => find.word ^= true,
-                2 => find.regex ^= true,
-                _ => find.inside ^= true,
-            }
+            find.options.flip(option);
+        }
+        self.find_changed(cx);
+    }
+
+    /// The search keeps to the lines selected when the bar opened, or not.
+    pub(super) fn find_flip_inside(&mut self, cx: &mut Context<Self>) {
+        if let Some(find) = &mut self.find {
+            find.inside ^= true;
         }
         self.find_changed(cx);
     }
@@ -300,7 +300,7 @@ impl Editor {
         let (t, find) = (self.theme, self.find.as_ref()?);
         let keys = |action: &dyn gpui::Action| crate::ui::keys::of(cx, action);
         let field = |id: &'static str, field: &Entity<Field>, hint: &'static str| {
-            let (on, empty) = (field.focus_handle(cx).is_focused(window), field.read(cx).line.text.is_empty());
+            let (on, empty) = (field.focus_handle(cx).is_focused(window), field.read(cx).text().is_empty());
             crate::ui::widgets::field_frame(id, field.clone(), on, empty, hint, t)
         };
         let toggle = |id, label, on, name, keys| crate::ui::widgets::toggle(id, label, on, name, keys, t);
@@ -310,11 +310,11 @@ impl Editor {
         let query = find.query(cx);
         let count = match (query.is_empty(), find.hits.len()) {
             (true, _) => String::new(),
-            (false, _) if md::broken(&query, find.word, find.regex) => tr("Invalid expression", "Expression invalide").into(),
+            (false, _) if crate::logic::search::broken(&query, find.options) => tr("Invalid expression", "Expression invalide").into(),
             (false, 0) => tr("No results", "Aucun résultat").into(),
             (false, n) => format!("{} / {n}", find.at + 1),
         };
-        let flip = |which: usize| cx.listener(move |this, _: &gpui::ClickEvent, _, cx| this.find_flip(which, cx));
+        let flip = |option| cx.listener(move |this, _: &gpui::ClickEvent, _, cx| this.find_flip(option, cx));
         // The chevron: the replace line, shown or not.
         let chevron = crate::ui::widgets::button("find-chevron", if find.replace { "chevron-down.svg" } else { "chevron-right.svg" }, false, t)
             .debug_selector(|| "find-chevron".into())
@@ -327,12 +327,10 @@ impl Editor {
             .gap_1()
             .child(chevron)
             .child(field("find-query", &find.query, tr("Find", "Chercher")))
-            .child(div().debug_selector(|| "find-count".into()).flex_none().text_size(t.px(12.)).text_color(t.soft).child(count))
-            .child(toggle("find-case", "Aa", find.case, tr("Match case", "Respecter la casse"), keys(&FindCase)).on_click(flip(0)))
-            .child(toggle("find-word", "\u{201c}ab\u{201d}", find.word, tr("Whole words", "Mots entiers"), keys(&FindWord)).on_click(flip(1)))
-            .child(toggle("find-regex", ".*", find.regex, tr("Regular expression", "Expression régulière"), keys(&FindRegex)).on_click(flip(2)))
+            .child(div().debug_selector(|| "find-count".into()).flex_none().text_size(t.font_small()).text_color(t.soft).child(count))
+            .children(crate::ui::widgets::find_toggles(["find-case", "find-word", "find-regex"], find.options, [keys(&FindCase), keys(&FindWord), keys(&FindRegex)], t, flip))
             .children(find.span.as_ref().map(|_| {
-                icon("find-inside", "in-selection.svg", find.inside, tr("In the selected lines only", "Seulement dans les lignes choisies"), String::new()).on_click(flip(3))
+                icon("find-inside", "in-selection.svg", find.inside, tr("In the selected lines only", "Seulement dans les lignes choisies"), String::new()).on_click(cx.listener(|this, _, _, cx| this.find_flip_inside(cx)))
             }));
         let second = find.replace.then(|| {
             div()
@@ -350,7 +348,7 @@ impl Editor {
         let bar = div()
             .id("find-bar")
             .debug_selector(|| "find-bar".into())
-            .key_context("Find")
+            .key_context(crate::ui::keys::context::FIND)
             .w(t.px(400.))
             .max_w_full()
             .p_1p5()
@@ -358,7 +356,7 @@ impl Editor {
             .bg(t.panel)
             .border_1()
             .border_color(t.border)
-            .text_size(t.px(13.))
+            .text_size(t.font_body())
             .text_color(t.text)
             .cursor(CursorStyle::Arrow)
             .flex()
@@ -378,9 +376,9 @@ impl Editor {
                 true => this.replace_one(cx),
                 false => this.find_step(true, window, cx),
             }))
-            .on_action(cx.listener(|this, _: &FindCase, _, cx| this.find_flip(0, cx)))
-            .on_action(cx.listener(|this, _: &FindWord, _, cx| this.find_flip(1, cx)))
-            .on_action(cx.listener(|this, _: &FindRegex, _, cx| this.find_flip(2, cx)))
+            .on_action(cx.listener(|this, _: &FindCase, _, cx| this.find_flip(crate::logic::search::FindOption::Case, cx)))
+            .on_action(cx.listener(|this, _: &FindWord, _, cx| this.find_flip(crate::logic::search::FindOption::Word, cx)))
+            .on_action(cx.listener(|this, _: &FindRegex, _, cx| this.find_flip(crate::logic::search::FindOption::Regex, cx)))
             .on_action(cx.listener(|this, _: &ReplaceAll, _, cx| this.replace_all(cx)))
             .on_action(cx.listener(|this, _: &ReplaceInVault, _, cx| this.replace_in_vault(cx)))
             .child(first)

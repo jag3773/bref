@@ -7,7 +7,7 @@ impl Render for Editor {
         // Left of the buttons the window puts in the corner (copy, comments).
         // The count is truncated in a narrow note, instead of going out on the left.
         let t = self.theme;
-        let after = (12. + 34. * self.corner as f32) * t.ui;
+        let after = (12. + 34. * self.chrome.corner as f32) * t.ui;
         // The formatting bar, in the middle of the page, apart from the counter, which stays at the right.
         self.bar.at = self.bar_place();
         let folded = self.bar.at == Some(Bar::Compact);
@@ -29,7 +29,7 @@ impl Render for Editor {
                 .flex()
                 .items_center()
                 .bg(self.theme.bg)
-                .text_size(t.px(12.))
+                .text_size(t.font_small())
                 .text_color(self.theme.soft)
                 .child(div().min_w_0().truncate().child(self.counts())),
         );
@@ -59,7 +59,7 @@ impl Render for Editor {
         let el = div()
             .size_full()
             .relative()
-            .key_context("Editor")
+            .key_context(crate::ui::keys::context::EDITOR)
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam);
         let el = motions!(el,
@@ -140,16 +140,16 @@ impl Render for Editor {
         .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(false, cx)))
         .on_action(cx.listener(|this, _: &Cut, _, cx| this.copy(true, cx)))
         .on_action(cx.listener(|this, _: &Paste, _, cx| this.each(cx, |this, cx| this.paste(cx))))
-        .on_action(cx.listener(|this, _: &Undo, _, cx| this.restore(false, cx)))
-        .on_action(cx.listener(|this, _: &Redo, _, cx| this.restore(true, cx)))
+        .on_action(cx.listener(|this, _: &Undo, _, cx| this.undo(cx)))
+        .on_action(cx.listener(|this, _: &Redo, _, cx| this.redo(cx)))
         // The bar's keys that also work from the note while it is open; its others are on the bar.
         .on_action(cx.listener(|this, _: &Find, window, cx| this.open_find(false, window, cx)))
         .on_action(cx.listener(|this, _: &FindReplace, window, cx| this.open_find(true, window, cx)))
         .on_action(cx.listener(|this, _: &FindNext, window, cx| this.find_step(true, window, cx)))
         .on_action(cx.listener(|this, _: &FindPrev, window, cx| this.find_step(false, window, cx)))
-        .on_action(cx.listener(|this, _: &FindCase, _, cx| this.find_flip(0, cx)))
-        .on_action(cx.listener(|this, _: &FindWord, _, cx| this.find_flip(1, cx)))
-        .on_action(cx.listener(|this, _: &FindRegex, _, cx| this.find_flip(2, cx)))
+        .on_action(cx.listener(|this, _: &FindCase, _, cx| this.find_flip(crate::logic::search::FindOption::Case, cx)))
+        .on_action(cx.listener(|this, _: &FindWord, _, cx| this.find_flip(crate::logic::search::FindOption::Word, cx)))
+        .on_action(cx.listener(|this, _: &FindRegex, _, cx| this.find_flip(crate::logic::search::FindOption::Regex, cx)))
         .on_action(cx.listener(|this, _: &Cancel, _, cx| {
             // The color badges close first.
             if std::mem::take(&mut this.bar.swatches) || std::mem::take(&mut this.bar.open) {

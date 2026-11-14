@@ -290,7 +290,9 @@ impl Diagram {
                             // A call to oneself lasts as long as its loop, unless an answer comes.
                             marks.bars.push(Bar { life: on, x: x_of(on, depth(&open, on)), y0: y, y1: y + LOOP.1, depth: depth(&open, on) });
                         } else {
-                            open.push((on, y, from));
+                            // A created lifeline's head is centred on the message: its bar begins under it.
+                            let start = if Message::of(link) == Message::Create { y + HEAD / 2. } else { y };
+                            open.push((on, start, from));
                         }
                     }
                 }
@@ -370,6 +372,13 @@ impl Diagram {
             _ => xb,
         };
         Some(vec![(start, y), (end, y)])
+    }
+
+    /// Normalisation after any edit, for the canvas and MCP alike: lifelines follow their messages, then a pin
+    /// stays on the border of the shape it is on.
+    pub fn normalise(&mut self) {
+        self.fit_sequence();
+        self.seat_pins();
     }
 
     /// Lays the lifelines out as the messages ask: the heads of those not created on one line, those
@@ -461,7 +470,7 @@ impl Diagram {
             }
         }
         // A fragment comes after what it holds the shapes of in the drawing order: it is under the lifelines' marks.
-        self.fit_sequence();
+        self.normalise();
         Some(id)
     }
 
@@ -689,6 +698,20 @@ mod tests {
         let marks = d.marks();
         assert_eq!(marks.crosses, [(third.x + third.w / 2., 224.)]);
         assert_eq!(third.y + third.h, 224. + 14.);
+    }
+
+    #[test]
+    fn the_bar_of_a_created_lifeline_starts_below_its_head() {
+        // The created lifeline is called at once (a bar open), and again later; and one is created then left unanswered.
+        let (d, lives, _) = talk(3, &[(0, 1, Message::Create), (0, 1, Message::Sync), (1, 0, Message::Reply), (0, 2, Message::Create), (0, 2, Message::Sync)]);
+        for life in [lives[1], lives[2]] {
+            let head = d.shape(life).unwrap();
+            let bars: Vec<_> = d.marks().bars.into_iter().filter(|b| b.life == life).collect();
+            assert!(!bars.is_empty());
+            for bar in bars {
+                assert!(bar.y0 >= head.y + HEAD, "bar from {} over a head ending at {}", bar.y0, head.y + HEAD);
+            }
+        }
     }
 
     #[test]

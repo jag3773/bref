@@ -1,99 +1,41 @@
 //! The diagram file: its drawing as SVG, and its source in `<metadata>`, read and written.
 
 use super::*;
+use crate::logic::xml;
 
 impl Diagram {
     /// The diagram file: its drawing as SVG, and its source in `<metadata>`.
     /// `neutral` is the neutral stroke color, as `0xrrggbb`.
     pub fn to_svg(&self, neutral: u32) -> String {
         let color = |i: u8| format!("#{:06x}", if i == 0 { neutral } else { COLORS[i as usize % COLORS.len()] });
-        let (traces, flow) = self.traces();
-        let (x0, y0, x1, y1) = self.bounds_of(&traces).unwrap_or((0., 0., 100., 60.));
+        let scene = self.scene(None);
+        let (x0, y0, x1, y1) = self.bounds_of(&scene.traces).unwrap_or((0., 0., 100., 60.));
         let (x0, y0, w, h) = (x0 - 16., y0 - 16., x1 - x0 + 32., y1 - y0 + 32.);
         let mut out = format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"{} {} {} {}\" fill=\"none\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" font-family=\"sans-serif\" font-size=\"{FONT}\">\n",
             num(w), num(h), num(x0), num(y0), num(w), num(h),
         );
-        let dash = |dashed: bool| if dashed { " stroke-dasharray=\"6 4\"" } else { "" };
-        let label = |out: &mut String, x: f32, y: f32, spans: &[Span], anchor: Anchor, ink: &str| {
-            if spans.is_empty() {
-                return;
-            }
-            let anchor = match anchor {
-                Anchor::Start => "",
-                Anchor::Middle => " text-anchor=\"middle\"",
-                Anchor::End => " text-anchor=\"end\"",
-            };
-            // One style for the whole line: on the `<text>`; several: a `<tspan>` for each run.
-            let uniform = spans.windows(2).all(|w| w[0].style == w[1].style);
-            let (attrs, body) = match uniform {
-                true => (style_attrs(spans[0].style), xml(&spans.iter().map(|s| s.text.as_str()).collect::<String>())),
-                false => (String::new(), spans.iter().map(|s| format!("<tspan{}>{}</tspan>", style_attrs(s.style), xml(&s.text))).collect()),
-            };
-            let _ = writeln!(out, "<text x=\"{}\" y=\"{}\"{anchor}{attrs} fill=\"{ink}\" stroke=\"none\">{body}</text>", num(x), num(y + FONT));
-        };
-        for shape in &self.shapes {
-            let ink = color(shape.color);
-            for (i, path) in shape.outline().iter().enumerate() {
-                let fill = if shape.solid().contains(&i) {
-                    format!(" fill=\"{ink}\"")
-                } else if i == 0 && shape.fill {
-                    format!(" fill=\"{ink}\" fill-opacity=\"0.15\"")
-                } else {
-                    String::new()
-                };
-                let _ = writeln!(out, "<path d=\"{}\" stroke=\"{ink}\"{fill}{}/>", path_d(path), dash(shape.dashed || shape.dashed_paths().contains(&i)));
-            }
-            let (lines, rules) = self.lines(shape);
-            for y in rules {
-                let (x0, x1) = shape.rule_span(y);
-                // Between the operands of a combined fragment: dashed.
-                let _ = writeln!(out, "<path d=\"M{} {}H{}\" stroke=\"{ink}\"{}/>", num(x0), num(y), num(x1), dash(shape.form == Form::Fragment));
-            }
-            for (line, spans) in lines.iter().zip(self.runs(shape, false)) {
-                label(&mut out, line.x, line.y, &spans, line.centered.into(), &ink);
-            }
-        }
-        // What the messages add: the bars of the lifelines that are busy, the cross of one that is destroyed.
-        let marks = &flow.marks;
-        for bar in &marks.bars {
-            let (x, y, w, h) = bar.rect();
-            let ink = color(self.shape(bar.life).map_or(0, |s| s.color));
-            let _ = writeln!(out, "<path d=\"M{} {}H{}V{}H{}Z\" stroke=\"{ink}\" fill=\"{ink}\" fill-opacity=\"0.15\"/>", num(x), num(y), num(x + w), num(y + h), num(x));
-        }
-        for (x, y) in &marks.crosses {
-            let _ = writeln!(out, "<path d=\"M{} {}L{} {}M{} {}L{} {}\" stroke=\"{}\"/>", num(x - 10.), num(y - 10.), num(x + 10.), num(y + 10.), num(x + 10.), num(y - 10.), num(x - 10.), num(y + 10.), color(0));
-        }
-        for (link, trace) in self.links.iter().zip(traces) {
-            let Some(trace) = trace else { continue };
-            let ink = color(link.color);
-            let _ = writeln!(out, "<path d=\"{}\" stroke=\"{ink}\"{}/>", path_d(&trace.line), dash(link.dashed));
-            for (path, full) in &trace.heads {
-                let fill = if *full { format!(" fill=\"{ink}\"") } else { String::new() };
-                let _ = writeln!(out, "<path d=\"{}\" stroke=\"{ink}\"{fill}/>", path_d(path));
-            }
-            let shown = self.shown_text(link);
-            let lines: Vec<&str> = if shown.is_empty() { vec![""] } else { shown.split('\n').collect() };
-            for (i, text) in lines.iter().enumerate() {
-                let (x, y, centered) = Diagram::label_at(&trace, i, lines.len());
-                label(&mut out, x, y, &self.label_runs(text), centered.into(), &ink);
-            }
-            for (tip, slot) in [(trace.tips[0], Slot::Start), (trace.tips[1], Slot::End)] {
-                let along = if slot == Slot::Start { link.start_along } else { link.end_along };
-                let lines: Vec<&str> = link.text_of(slot).split('\n').filter(|_| !link.text_of(slot).is_empty()).collect();
-                for (i, text) in lines.iter().enumerate() {
-                    let (x, y, anchor) = Diagram::tip_label_at(&tip, along, i, lines.len());
-                    label(&mut out, x, y, &self.styled(text, false), anchor, &ink);
+        for item in &scene.items {
+            match item {
+                Item::Path(stroke) => {
+                    let ink = color(stroke.ink);
+                    let fill = match stroke.fill {
+                        Fill::None => String::new(),
+                        Fill::Tint => format!(" fill=\"{ink}\" fill-opacity=\"0.15\""),
+                        Fill::Solid => format!(" fill=\"{ink}\""),
+                    };
+                    let dash = if stroke.dashed { " stroke-dasharray=\"6 4\"" } else { "" };
+                    let _ = writeln!(out, "<path d=\"{}\" stroke=\"{ink}\"{fill}{dash}/>", path_d(&stroke.path));
                 }
+                Item::Text(label) => text(&mut out, label, &color(label.ink)),
             }
         }
-        let _ = write!(out, "<metadata id=\"bref-diagram\">\n{}</metadata>\n</svg>\n", xml(&self.source()));
+        let _ = write!(out, "<metadata id=\"bref-diagram\">\n{}</metadata>\n</svg>\n", xml::escape(&self.source()));
         out
     }
 
     /// The source: its version, then one line per element, text last, then the lines kept as found.
     fn source(&self) -> String {
-        let name = |form: Form| Form::ALL.iter().find(|(f, _)| *f == form).map_or("rect", |(_, n)| n);
         let tip = |head: Head| Head::ALL.iter().find(|(h, _)| *h == head).map_or("none", |(_, n)| n);
         let end = |end: End| match end {
             End::Shape(id) => format!("s{id}"),
@@ -105,7 +47,7 @@ impl Diagram {
         let text = |text: &str| text.replace('\\', "\\\\").replace('\n', "\\n");
         let mut out = format!("version {}\n{}{}", self.needed(), if self.rich { "rich 1\n" } else { "" }, if self.numbered { "numbered 1\n" } else { "" });
         for s in &self.shapes {
-            let _ = writeln!(out, "shape {} {} {} {} {} {} {} {} {} {}", s.id, name(s.form), num(s.x), num(s.y), num(s.w), num(s.h), s.color, s.fill as u8, s.dashed as u8, text(&s.text));
+            let _ = writeln!(out, "shape {} {} {} {} {} {} {} {} {} {}", s.id, s.form.name(), num(s.x), num(s.y), num(s.w), num(s.h), s.color, s.fill as u8, s.dashed as u8, text(&s.text));
         }
         for l in &self.links {
             let route = Route::ALL.iter().find(|(r, _)| *r == l.route).map_or("straight", |(_, n)| n);
@@ -211,7 +153,7 @@ impl Diagram {
                     let n = |i: usize| f.get(i)?.parse::<f32>().ok();
                     diagram.shapes.push(Shape {
                         id: f.first()?.parse().ok()?,
-                        form: Form::ALL.iter().find(|(_, name)| Some(name) == f.get(1)).map(|(form, _)| *form)?,
+                        form: Form::named(f.get(1)?)?,
                         x: n(2)?,
                         y: n(3)?,
                         w: n(4)?,
@@ -307,6 +249,26 @@ impl Diagram {
     }
 }
 
+/// A line of text as a `<text>`: nothing for an empty one.
+fn text(out: &mut String, label: &Label, ink: &str) {
+    let spans = &label.spans;
+    if spans.is_empty() {
+        return;
+    }
+    let anchor = match label.anchor {
+        Anchor::Start => "",
+        Anchor::Middle => " text-anchor=\"middle\"",
+        Anchor::End => " text-anchor=\"end\"",
+    };
+    // One style for the whole line: on the `<text>`; several: a `<tspan>` for each run.
+    let uniform = spans.windows(2).all(|w| w[0].style == w[1].style);
+    let (attrs, body) = match uniform {
+        true => (style_attrs(spans[0].style), xml::escape(&spans.iter().map(|s| s.text.as_str()).collect::<String>())),
+        false => (String::new(), spans.iter().map(|s| format!("<tspan{}>{}</tspan>", style_attrs(s.style), xml::escape(&s.text))).collect()),
+    };
+    let _ = writeln!(out, "<text x=\"{}\" y=\"{}\"{anchor}{attrs} fill=\"{ink}\" stroke=\"none\">{body}</text>", num(label.x), num(label.y + FONT));
+}
+
 /// SVG attributes of a text style, with a leading space each.
 fn style_attrs(style: Style) -> String {
     let mut out = String::new();
@@ -338,10 +300,6 @@ fn num(v: f32) -> String {
     if v.fract() == 0. { format!("{v:.0}") } else { format!("{v:.1}") }
 }
 
-fn xml(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
 fn path_d(path: &[Cmd]) -> String {
     let mut d = String::new();
     for cmd in path {
@@ -361,7 +319,50 @@ mod tests {
 
     /// A diagram file around `source`, as another version of Bref would have written it.
     fn file(source: &str) -> String {
-        format!("<svg>\n<metadata id=\"bref-diagram\">\n{}</metadata>\n</svg>\n", xml(source))
+        format!("<svg>\n<metadata id=\"bref-diagram\">\n{}</metadata>\n</svg>\n", xml::escape(source))
+    }
+
+    /// A diagram that draws everything the SVG writer knows: every form, fills, dashes, heads, texts
+    /// at the ends, a numbered sequence with a bar, a destroy cross and a fragment, styled and class texts.
+    fn rich_sample() -> Diagram {
+        let mut d = Diagram::blank();
+        for (i, (form, _)) in Form::ALL.iter().enumerate() {
+            let (w, h) = form.default_size();
+            let s = d.add_shape_mut(*form, (i % 8) as f32 * 300., (i / 8) as f32 * 260. - 600., w, h);
+            s.text = format!("{form:?} *it* **b**\n---\n+ x: int");
+            (s.color, s.fill, s.dashed) = ((i % 4) as u8, i % 3 == 0, i % 5 == 0);
+        }
+        let a = d.add_shape(Form::Rect, 0., 800., 200., 80.);
+        d.shape_mut(a).unwrap().text = "Shape\n---\n+ area(): f32\n---\n~~old~~ `List<T>` <&>".into();
+        let b = d.add_shape(Form::Ellipse, 400., 800., 120., 80.);
+        let l = d.add_link(End::Shape(a), End::Shape(b), Head::Triangle, Route::Elbow);
+        let link = d.link_mut(l).unwrap();
+        (link.text, link.start_text, link.end_text, link.color, link.dashed) = ("*calls*\nsecond".into(), "1..*".into(), "role\n+x".into(), 2, true);
+        link.start = Head::Diamond;
+        let lives: Vec<u32> = (0..3).map(|i| d.add_shape(Form::Lifeline, 100. + 180. * i as f32, 1000., 100., 200.)).collect();
+        let frag = d.add_shape(Form::Fragment, 60., 1060., 500., 100.);
+        d.shape_mut(frag).unwrap().text = "alt\n[ok]\n[else]".into();
+        let mut say = Vec::new();
+        for (from, to, end, dashed, text) in [(0, 1, Head::TriangleFull, false, "call"), (1, 2, Head::Arrow, true, "«create»"), (2, 1, Head::Arrow, true, "back"), (1, 2, Head::TriangleFull, false, "«destroy»")] {
+            let id = d.add_link(End::Life(lives[from]), End::Life(lives[to]), Head::None, Route::Straight);
+            let link = d.link_mut(id).unwrap();
+            (link.end, link.dashed, link.text) = (end, dashed, text.into());
+            say.push(id);
+        }
+        d.numbered = true;
+        d.set_parent(say[0], Some(frag));
+        d.normalise();
+        d
+    }
+
+    #[test]
+    fn svg_of_a_rich_sample_is_unchanged() {
+        let svg = rich_sample().to_svg(COLORS[0]);
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/src/logic/diagram/fixtures/rich.svg");
+        if std::env::var_os("BLESS").is_some() {
+            std::fs::write(fixture, &svg).unwrap();
+        }
+        assert!(svg == std::fs::read_to_string(fixture).unwrap(), "to_svg changed: compare with {fixture}");
     }
 
     #[test]

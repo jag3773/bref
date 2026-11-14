@@ -1,5 +1,6 @@
 //! The vault: choosing it, scanning and watching it, icons, backup, trash, terminal.
 
+use crate::platform::{config, signal, terminal, backup};
 use super::*;
 
 impl Shell {
@@ -18,14 +19,17 @@ impl Shell {
             return;
         }
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let signal = Arc::new(vault::Signal::default());
-        if platform::link::open(asked.clone(), signal.clone()).is_err() {
+        let signal = Arc::new(signal::Signal::default());
+        if let Err(e) = platform::link::open(asked.clone(), signal.clone()) {
+            eprintln!("bref: agent door closed: {e}");
+            let why = crate::lang::io_reason(&e);
+            self.say(Tone::Failed, format!("{} {why}", tr("An agent cannot make Bref show a note:", "Un agent ne peut pas faire afficher une note :")), cx);
             return;
         }
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 signal.wait(cx.background_executor().timer(Duration::from_secs(3600))).await;
-                let each: Vec<platform::link::Asked> = std::mem::take(&mut *asked.lock().unwrap());
+                let each: Vec<platform::link::Asked> = std::mem::take(&mut *asked.lock().unwrap_or_else(|e| e.into_inner()));
                 for ask in each {
                     let Ok(answer) = this.update_in(cx, |this, window, cx| this.show_asked(&ask.path, window, cx)) else {
                         return;
@@ -69,7 +73,7 @@ impl Shell {
     // Tests install no watcher: their clock is simulated.
     pub(super) fn watch(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let changed = Arc::new(vault::Signal::default());
+            let changed = Arc::new(signal::Signal::default());
             let mut watched: Option<(PathBuf, Option<notify::RecommendedWatcher>)> = None;
             let mut last = None;
             let mut pause = Duration::from_secs(2);
@@ -85,7 +89,9 @@ impl Shell {
                     cx.background_executor().timer(pause).await;
                     false
                 };
-                let Ok(state) = this.update(cx, |this, _| this.vault.clone().map(|root| (root, this.save_gen)))
+                // A vault still being read for the first time is left alone: on a slow disk that read
+                // outlasts the pause, and a second one beside it would cost its time and its memory twice.
+                let Ok(state) = this.update(cx, |this, _| this.vault.clone().filter(|_| !this.scanning).map(|root| (root, this.save_gen)))
                 else {
                     return;
                 };
@@ -160,25 +166,24 @@ impl Shell {
         mut images: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        // Same notes, same tags, same links? Each reread note is compared with the one we had
+        // Same notes, same tags, links and aliases? Each reread note is compared with the one we had
         // under its path, without copying or sorting anything.
         let had: std::collections::HashMap<&Path, &Note> = self.notes.iter().map(|n| (n.path.as_path(), n)).collect();
-        let same = notes.len() == had.len() && notes.iter().all(|n| had.get(n.path.as_path()).is_some_and(|o| o.tags == n.tags && o.links == n.links));
+        let same = notes.len() == had.len() && notes.iter().all(|n| had.get(n.path.as_path()).is_some_and(|o| o.tags == n.tags && o.links == n.links && o.aliases == n.aliases));
         dirs.sort();
         self.dirs.sort();
         images.sort();
         self.images.sort();
         if !same || dirs != self.dirs || images != self.images {
-            self.notes = notes;
+            self.replace_notes(notes, true);
             self.dirs = dirs;
             self.images = images;
-            self.push_names(cx);
-            self.graph_stale = true;
-            self.refresh_graph(cx);
+            self.index_changed(cx);
             cx.notify();
         } else {
-            // No name, tag or link changed, but the text may have: search follows it.
-            self.notes = notes;
+            // No name, tag or link changed, but the text may have: search and the health page follow it.
+            self.replace_notes(notes, false);
+            self.refresh_health(cx);
         }
         self.each_pane(|this| {
             // The shown table was rewritten elsewhere: it is reread if nothing is pending here.
@@ -217,14 +222,15 @@ impl Shell {
         self.vault = Some(root.clone());
         self.lost = None;
         self.icons = vault::load_icons(&root);
-        self.notes.clear();
+        self.replace_notes(Vec::new(), true);
         self.dirs.clear();
         self.images.clear();
         self.recent.clear();
         self.new_note(String::new(), cx);
-        vault::save_config(&root, &[]);
+        config::save_config(&root, &[]);
         window.focus(&self.pane().editor.focus_handle(cx));
         // The index (names, tags) is built off the UI thread.
+        self.scanning = true;
         cx.spawn(async move |this, cx| {
             let scan_root = root.clone();
             let (notes, dirs, images, unreadable) = cx
@@ -233,13 +239,12 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 if this.vault.as_ref() == Some(&root) {
+                    this.scanning = false;
                     this.unreadable = unreadable;
-                    this.notes = notes;
+                    this.replace_notes(notes, true);
                     this.dirs = dirs;
                     this.images = images;
-                    this.push_names(cx);
-                    this.graph_stale = true;
-                    this.refresh_graph(cx);
+                    this.index_changed(cx);
                     cx.notify();
                 }
             })
@@ -278,6 +283,85 @@ impl Shell {
         .detach();
     }
 
+    /// Everything that must follow a change of the index (`notes`, `images`): the names offered
+    /// by the editors, the graph and the health page. Call it after the change, never set `graph_stale` by hand.
+    pub(super) fn index_changed(&mut self, cx: &mut Context<Self>) {
+        self.push_names(cx);
+        self.graph_changed(cx);
+    }
+
+    /// Only the graph follows: for a rewrite of note text, which leaves the names as they are
+    /// (`index_changed` when a name, an alias or an image may have changed).
+    pub(super) fn graph_changed(&mut self, cx: &mut Context<Self>) {
+        (self.graph_stale, self.health_stale) = (true, true);
+        self.refresh_graph(cx);
+    }
+
+    // The only places `self.notes` is written (the call to `index_changed` or `graph_changed`
+    // stays with the caller, once per batch): each marks the graph stale when it can change it.
+
+    /// The whole index replaced; `graph_changed` is false when only the text moved.
+    pub(super) fn replace_notes(&mut self, notes: Vec<Note>, graph_changed: bool) {
+        self.notes = notes;
+        self.graph_stale |= graph_changed;
+        // Any text may empty a note or break its front matter: the health page looks again.
+        self.health_stale = true;
+    }
+
+    /// The text of the note at `path` rewritten in the index (not on disk); its previous text,
+    /// or `None` if the index does not know the note.
+    pub(super) fn edit_note_text(&mut self, path: &Path, text: Arc<str>) -> Option<Arc<str>> {
+        let template = self.vault.as_ref().is_some_and(|r| vault::in_templates(r, path));
+        let note = self.notes.iter_mut().find(|note| note.path == path)?;
+        (self.graph_stale, self.health_stale) = (true, true);
+        Some(note.set_text(text, template))
+    }
+
+    /// `[[old]]` links rewritten to `new` in the notes that link to it (on disk and in the index). The
+    /// caller follows with `graph_changed` if some note was rewritten.
+    pub(super) fn relink_notes(&mut self, old: &str, new: &str) -> vault::Relinked {
+        self.health_stale = true;
+        vault::relink(self.vault.as_deref(), &mut self.notes, old, new)
+    }
+
+    /// The same for a renamed heading (`[[Note#old]]` → `[[Note#new]]`); the graph links notes, not
+    /// headings, so it stays as it is. Returns the notes rewritten.
+    pub(super) fn follow_heading_notes(&mut self, path: &Path, was: &str, now: &str) -> Vec<PathBuf> {
+        self.health_stale = true;
+        vault::follow_heading(self.vault.as_deref(), &mut self.notes, path, was, now)
+    }
+
+    /// The notes `gone` says leave the index.
+    pub(super) fn forget_notes(&mut self, gone: impl Fn(&PathBuf) -> bool) {
+        self.notes.retain(|n| !gone(&n.path));
+        (self.graph_stale, self.health_stale) = (true, true);
+    }
+
+    /// Every note path moved by `shift` (a note or folder was renamed).
+    pub(super) fn move_notes(&mut self, shift: impl Fn(&PathBuf) -> PathBuf) {
+        for note in &mut self.notes {
+            note.path = shift(&note.path);
+            note.name = vault::stem(&note.path);
+        }
+        (self.graph_stale, self.health_stale) = (true, true);
+    }
+
+    /// `fresh` (just saved) becomes the first note, in place of the one at `old` and of any at
+    /// its own path. The graph is marked stale only if the note is new, renamed or linked
+    /// differently. Returns the text of the replaced note, as it was last saved.
+    pub(super) fn put_note(&mut self, old: Option<&PathBuf>, fresh: Note) -> Option<Arc<str>> {
+        let known = self.notes.iter().find(|n| Some(&n.path) == old);
+        if known.is_none_or(|n| n.path != fresh.path || n.links != fresh.links || n.aliases != fresh.aliases) {
+            self.graph_stale = true;
+        }
+        // Any text may empty a note or break its front matter: the health page looks again.
+        self.health_stale = true;
+        let before = known.map(|n| n.body.clone());
+        self.notes.retain(|n| Some(&n.path) != old && n.path != fresh.path);
+        self.notes.insert(0, fresh);
+        before
+    }
+
     pub(super) fn push_names(&mut self, cx: &mut Context<Self>) {
         self.push_names_to(0..self.panes.len(), cx);
     }
@@ -286,19 +370,15 @@ impl Shell {
     pub(super) fn push_names_to(&mut self, tabs: std::ops::Range<usize>, cx: &mut Context<Self>) {
         // Aliases are offered after `[[` like names.
         let notes: Vec<&Note> = self.notes.iter().filter(|n| !self.is_template(n)).collect();
-        let names: std::rc::Rc<[String]> = notes.iter().map(|n| n.name.clone()).chain(notes.iter().flat_map(|n| n.aliases.iter().cloned())).collect();
+        let names: Vec<String> = notes.iter().map(|n| n.name.clone()).chain(notes.iter().flat_map(|n| n.aliases.iter().cloned())).collect();
         let pictures = vault::pictures(&self.images);
         // Notes and their aliases, for the sections embedded from them.
-        let sources: std::rc::Rc<std::collections::HashMap<String, PathBuf>> =
-            notes.iter().flat_map(|n| std::iter::once(n.name.as_str()).chain(n.aliases.iter().map(String::as_str)).map(|name| (name.to_lowercase(), n.path.clone()))).collect::<std::collections::HashMap<_, _>>().into();
+        let sources = logic::wiki::by_key(notes.iter().copied()).into_iter().map(|(key, i)| (key.as_str().to_string(), notes[i].path.clone())).collect();
+        let lookups = std::rc::Rc::new(crate::views::editor::VaultLookups::new(names, &pictures, sources));
         let me = |pane: &Pane| pane.path.as_deref().and_then(Path::file_stem).map(|s| s.to_string_lossy().to_string());
         for pane in &self.panes[tabs] {
             let me = me(pane);
-            pane.editor.update(cx, |e, _| {
-                e.set_notes(names.clone());
-                e.set_images(&pictures);
-                e.set_sources(sources.clone(), me);
-            });
+            pane.editor.update(cx, |e, _| e.set_vault(lookups.clone(), me));
         }
     }
 
@@ -319,7 +399,7 @@ impl Shell {
         self.recent.insert(0, path.to_path_buf());
         self.recent.truncate(200);
         if let Some(root) = &self.vault {
-            vault::save_config(root, &self.recent);
+            config::save_config(root, &self.recent);
         }
     }
 
@@ -356,7 +436,7 @@ impl Shell {
         let Some(root) = self.vault.clone() else {
             return;
         };
-        if !vault::open_terminal(&root) {
+        if !terminal::open_terminal(&root) {
             let hint = tr("No terminal found: name yours in $TERMINAL", "Aucun terminal trouvé : nommer le vôtre dans $TERMINAL");
             self.say(Tone::Failed, hint, cx);
         }
@@ -389,7 +469,7 @@ impl Shell {
         self.say(Tone::Busy, tr("Backing up the vault…", "Sauvegarde du coffre…"), cx);
         let date = date_name(today());
         cx.spawn(async move |this, cx| {
-            let done = cx.background_executor().spawn(async move { vault::backup(&root, &dir, &date) }).await;
+            let done = cx.background_executor().spawn(async move { backup::backup(&root, &dir, &date) }).await;
             this.update(cx, |this, cx| match done {
                 Ok(to) => this.say(Tone::Done, format!("{} {}", tr("Backup saved:", "Sauvegarde enregistrée :"), to.display()), cx),
                 Err(e) => this.say(Tone::Failed, format!("{} : {}", tr("Backup failed", "Sauvegarde impossible"), crate::lang::io_reason(&e)), cx),
@@ -417,7 +497,7 @@ impl Shell {
                 return;
             }
             let chosen = palette.read(cx).chosen().and_then(|i| found.get(i)).filter(|_| matches!(event, PaletteEvent::Submit(_)));
-            match chosen.map(|path| vault::restore(&root, path)) {
+            match chosen.map(|path| vault::restore(&root, path).inspect(|to| crate::views::sheet::move_tables(path, to))) {
                 Some(Ok(to)) => {
                     let name = to.file_name().unwrap_or_default().to_string_lossy().into_owned();
                     this.say(Tone::Done, format!("{} {name}", tr("Restored:", "Restauré :")), cx);
@@ -433,5 +513,26 @@ impl Shell {
         window.focus(&palette.focus_handle(cx));
         self.palette = Some(palette);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `Shell::notes` changes only in this file (`replace_notes`, `put_note`…), which keep the graph
+    /// in step: nowhere else writes it or lends it out mutably.
+    #[test]
+    fn notes_are_written_only_in_the_library() {
+        let writes = ["&mut self.notes", "self.notes =", "self.notes.push", "self.notes.insert", "self.notes.retain", "self.notes.sort", "self.notes.iter_mut", "self.notes.clear", "self.notes.extend", "self.notes.remove"];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell");
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "rs") || path.file_name().is_some_and(|n| n == "library.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for write in writes {
+                assert!(!text.contains(write), "{} writes the index with `{write}`: go through library.rs", path.display());
+            }
+        }
     }
 }

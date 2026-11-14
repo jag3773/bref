@@ -1,5 +1,6 @@
 //! The help panel: every shortcut by section, searchable, and editable in place.
 
+use crate::platform::config;
 use super::*;
 
 /// The help panel: open or not, its search field, the row picked with the keyboard, and the
@@ -38,6 +39,15 @@ pub(super) struct KeyEdit {
 
 pub(super) const KOFI: &str = "https://ko-fi.com/T6T01WC5ZC";
 
+/// What the help is about (see `Shell::looking_at`).
+enum Looking {
+    Sheet,
+    Drawing,
+    Nothing,
+    NoteTable,
+    Block,
+}
+
 impl Shell {
     /// Shows or hides the shortcuts panel; focus follows.
     pub(super) fn set_help(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -58,13 +68,10 @@ impl Shell {
                         this.key_edit(action, cx);
                     }
                 } else if let field::FieldEvent::Cancel = event {
-                    if find.read(cx).line.text.is_empty() {
+                    if find.read(cx).text().is_empty() {
                         this.set_help(false, window, cx);
                     } else {
-                        find.update(cx, |find, cx| {
-                            find.line = line::Line::default();
-                            cx.notify();
-                        });
+                        find.update(cx, |find, cx| find.clear(cx));
                     }
                 }
             })
@@ -170,7 +177,7 @@ impl Shell {
             self.say(Tone::Info, tr("The system may keep these keys for itself.", "Le système garde peut-être ces touches pour lui."), cx);
         }
         self.rebind(cx);
-        vault::save_file("keys", &keys::write(&self.changes));
+        self.keep(config::File::Keys, &keys::write(&self.changes), cx);
     }
 
     /// Restores the original keys of one action, or of all.
@@ -181,7 +188,7 @@ impl Shell {
         }
         self.help.edit = None;
         self.rebind(cx);
-        vault::save_file("keys", &keys::write(&self.changes));
+        self.keep(config::File::Keys, &keys::write(&self.changes), cx);
     }
 
     /// Applies `changes`: the bindings in effect change right away, without restarting.
@@ -194,7 +201,7 @@ impl Shell {
 
     /// The help rows the search keeps.
     pub(super) fn help_rows(&self, cx: &App) -> keys::Sections {
-        let query = self.help.find.as_ref().map(|find| find.read(cx).line.text.clone()).unwrap_or_default();
+        let query = self.help.find.as_ref().map(|find| find.read(cx).text().to_string()).unwrap_or_default();
         let mut sections = keys::filter(help_sections(&self.bound, &self.changes), &query);
         // Opened on a table or a diagram, the panel starts with its keys.
         if let Some(at) = self.here(cx).and_then(|here| sections.iter().position(|(title, _)| *title == here)) {
@@ -204,34 +211,42 @@ impl Shell {
         sections
     }
 
-    /// The help section about what is shown: a CSV table, a diagram, a table
-    /// of the note under the cursor; none for an ordinary note, the help starts with notes.
-    pub(super) fn here(&self, cx: &App) -> Option<&'static str> {
+    /// What the help and the palette are about: a CSV table, a diagram, nothing (a picture, a list
+    /// page, a board: no text under the cursor), a table of the note, or the note's block. One chain
+    /// for both, so that they agree (a board hides its text, so it no longer offers table help).
+    fn looking_at(&self, cx: &App) -> Looking {
         if self.shown_sheet().is_some() {
-            Some(tr("CSV tables", "Tableaux CSV"))
+            Looking::Sheet
         } else if self.pane().drawing().is_some() {
-            Some(tr("Diagrams", "Schémas"))
-        } else if self.pane().file.is_none() && self.pane().listing.is_none() && self.pane().editor.read(cx).in_table() {
-            Some(tr("Tables in a note", "Tableaux d'une note"))
+            Looking::Drawing
+        } else if !self.pane().shows_note() || self.board_shown(cx) {
+            Looking::Nothing
+        } else if self.pane().editor.read(cx).in_table() {
+            Looking::NoteTable
         } else {
-            None
+            Looking::Block
         }
     }
 
-    /// The group of commands for what is being looked at, and its name for the palette field: a CSV
-    /// table, a diagram, a table of the note under the cursor, otherwise the cursor's block.
+    /// The help section about what is shown; none for an ordinary note, the help starts with notes.
+    pub(super) fn here(&self, cx: &App) -> Option<&'static str> {
+        match self.looking_at(cx) {
+            Looking::Sheet => Some(tr("CSV tables", "Tableaux CSV")),
+            Looking::Drawing => Some(tr("Diagrams", "Schémas")),
+            Looking::NoteTable => Some(tr("Tables in a note", "Tableaux d'une note")),
+            Looking::Nothing | Looking::Block => None,
+        }
+    }
+
+    /// The group of commands for what is being looked at, and its name for the palette field.
     pub(super) fn here_group(&self, cx: &App) -> (Option<commands::Group>, &'static str) {
         use commands::Group;
-        if self.shown_sheet().is_some() {
-            (Some(Group::Table), tr("CSV table", "Tableau CSV"))
-        } else if self.pane().drawing().is_some() {
-            (Some(Group::Diagram), tr("Diagram", "Schéma"))
-        } else if self.pane().file.is_some() || self.pane().listing.is_some() || self.board_shown(cx) {
-            (None, "")
-        } else if self.pane().editor.read(cx).in_table() {
-            (Some(Group::Table), tr("Table", "Tableau"))
-        } else {
-            (Some(Group::Block), "Note")
+        match self.looking_at(cx) {
+            Looking::Sheet => (Some(Group::Table), tr("CSV table", "Tableau CSV")),
+            Looking::Drawing => (Some(Group::Diagram), tr("Diagram", "Schéma")),
+            Looking::Nothing => (None, ""),
+            Looking::NoteTable => (Some(Group::Table), tr("Table", "Tableau")),
+            Looking::Block => (Some(Group::Block), "Note"),
         }
     }
 
@@ -240,7 +255,7 @@ impl Shell {
         let t = self.theme;
         let rows = self.help_rows(cx);
         let none = rows.is_empty();
-        let asked = self.help.find.as_ref().is_some_and(|find| !find.read(cx).line.text.is_empty());
+        let asked = self.help.find.as_ref().is_some_and(|find| !find.read(cx).text().is_empty());
         let small = |id: String, text: &'static str| {
             div()
                 .id(gpui::SharedString::from(id.clone()))
@@ -306,7 +321,7 @@ impl Shell {
                 .flex_wrap()
                 .items_center()
                 .gap_x_1()
-                .text_size(t.px(12.))
+                .text_size(t.font_small())
                 .children(titles.into_iter().enumerate().map(|(i, title)| {
                     small(format!("help-to-{i}"), title).text_color(t.accent).on_click(cx.listener(move |this, _, _, cx| {
                         this.help.scroll.scroll_to_item(i);
@@ -332,7 +347,7 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().mb_1().text_color(t.accent).text_size(t.px(12.)).child(title))
+                .child(div().mb_1().text_color(t.accent).text_size(t.font_small()).child(title))
                 .children(rows.into_iter().map(|row| {
                     let edit = self.help.edit.as_ref().filter(|edit| Some(edit.action) == row.action);
                     let chosen = row.action.is_some() && row.action == self.help.sel;
@@ -340,14 +355,14 @@ impl Shell {
                     let keys = match row.action {
                         // Badges for real keys; a line of words ("Drag from the tree") or of
                         // alternatives ("F3 / Enter") stays text.
-                        None if row.keys.contains(' ') => div().w(t.px(156.)).flex_none().font_family(mono()).text_size(t.px(12.)).child(row.keys.clone()),
+                        None if row.keys.contains(' ') => div().w(t.px(156.)).flex_none().font_family(t.mono).text_size(t.font_small()).child(row.keys.clone()),
                         None => div().w(t.px(156.)).flex_none().child(keycaps(&row.keys, t, false).flex_wrap()),
                         Some(action) => {
                             let color = if edit.is_some() || row.changed { t.accent } else { t.text };
                             let shown = if edit.is_some() {
-                                div().font_family(mono()).text_size(t.px(12.)).child(tr("Press the keys…", "Tapez les touches…"))
+                                div().font_family(t.mono).text_size(t.font_small()).child(tr("Press the keys…", "Tapez les touches…"))
                             } else if row.keys.is_empty() {
-                                div().font_family(mono()).text_size(t.px(12.)).child("—")
+                                div().font_family(t.mono).text_size(t.font_small()).child("—")
                             } else {
                                 keycaps(&row.keys, t, false).flex_wrap()
                             };
@@ -378,13 +393,13 @@ impl Shell {
                     };
                     // Under the row being typed: what to do, or what is wrong.
                     let note = edit.map(|edit| match &edit.issue {
-                        None => div().text_size(t.px(12.)).text_color(t.soft).child(tr(
+                        None => div().text_size(t.font_small()).text_color(t.soft).child(tr(
                             "Backspace: no shortcut · Esc: cancel",
                             "Retour arrière : aucun raccourci · Échap : annuler",
                         )),
-                        Some(KeyIssue::Refused(why)) => div().text_size(t.px(12.)).child(format!("{} : {why}", keys::show(&edit.keys))),
+                        Some(KeyIssue::Refused(why)) => div().text_size(t.font_small()).child(format!("{} : {why}", keys::show(&edit.keys))),
                         Some(KeyIssue::Taken(others)) => div()
-                            .text_size(t.px(12.))
+                            .text_size(t.font_small())
                             .flex()
                             .flex_wrap()
                             .items_center()
@@ -410,7 +425,7 @@ impl Shell {
                         .flex_col()
                         .gap_1()
                         .rounded(t.small())
-                        .when(chosen, |d| d.bg(t.selection.opacity(0.5)))
+                        .when(chosen, |d| d.bg(t.selection_idle()))
                         .child(div().flex().gap_3().child(keys).child(div().flex_1().min_w_0().text_color(if chosen { t.text } else { t.soft }).child(row.effect)))
                         .children(note)
                 }))
@@ -473,7 +488,7 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .text_size(t.px(13.))
+                    .text_size(t.font_body())
                     // A click in the panel does not close it.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_action(cx.listener(|this, _: &palette::Prev, _, cx| this.help_step(false, cx)))

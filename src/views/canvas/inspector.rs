@@ -102,7 +102,7 @@ impl Canvas {
         let t = self.theme;
         let links = self.selected.iter().any(|id| self.diagram.link(*id).is_some());
         let shapes = self.selected.iter().any(|id| self.diagram.shape(*id).is_some());
-        let alone = matches!(self.selected[..], [id] if self.diagram.shape(id).is_some_and(|s| matches!(s.form, diagram::Form::Round | diagram::Form::Composite)));
+        let alone = matches!(self.selected[..], [id] if self.diagram.shape(id).is_some_and(|s| s.form.round_outline()));
         let holder = matches!(self.selected[..], [id] if self.diagram.shape(id).is_some_and(|s| s.form.holds()) && !self.diagram.children(id).is_empty());
         // On a mixed selection a switch sets all to the same state: on unless all are on already.
         let filled = self.selected.iter().filter_map(|id| self.diagram.shape(*id)).all(|s| s.fill);
@@ -129,7 +129,7 @@ impl Canvas {
                 .gap_2()
                 .rounded(t.small())
                 .cursor_pointer()
-                .text_size(px(12.5))
+                .text_size(t.px(12.5))
                 .text_color(t.text)
                 .bg(if self.relations { t.selection } else { t.bg })
                 .border_1()

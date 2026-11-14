@@ -52,10 +52,11 @@ impl Shell {
     /// that it pastes anywhere. It is drawn off the UI thread.
     pub(super) fn export_png(&mut self, file: PathBuf, canvas: &Entity<Canvas>, cx: &mut Context<Self>) {
         let svg = canvas.read(cx).diagram().to_svg(0x1e1e1e);
+        let fonts = (self.theme.sans, self.theme.mono);
         let canvas = canvas.downgrade();
         cx.spawn(async move |this, cx| {
             let drawn = cx.background_executor().spawn(async move {
-                let bytes = figure::png(&svg, 2., 0xffffff).ok_or_else(|| std::io::Error::other("PNG"))?;
+                let bytes = figure::png(&svg, fonts, 2., 0xffffff).ok_or_else(|| std::io::Error::other("PNG"))?;
                 let path = vault::free_path(file.parent().unwrap_or(Path::new("")), &vault::stem(&file), "png");
                 crate::platform::export::save(&path, &bytes).map(|_| path)
             });
@@ -65,9 +66,7 @@ impl Shell {
                     Ok(path) => {
                         this.say(Tone::Done, format!("{} « {} »", tr("PNG exported", "PNG exporté"), path.display()), cx);
                         this.images.push(path);
-                        this.push_names(cx);
-                        this.graph_stale = true;
-                        this.refresh_graph(cx);
+                        this.index_changed(cx);
                         canvas.update(cx, |canvas, cx| canvas.exported(cx)).ok();
                     }
                     Err(e) => this.say(Tone::Failed, format!("{} : {}", tr("Picture not saved", "Image non enregistrée"), crate::lang::io_reason(&e)), cx),
@@ -150,7 +149,7 @@ impl Shell {
         })
         .detach();
         window.focus(&figure.focus_handle(cx));
-        self.pane_mut().figure = Some(figure);
+        self.pane_mut().set_cover(Cover::Figure(figure));
         cx.notify();
     }
 
@@ -160,7 +159,7 @@ impl Shell {
         let (Some(made), Some(dir)) = (logic::mermaid::to_diagram(source), self.diagram_dir().filter(|_| self.vault.is_some())) else { return };
         let name = self.pane().path.as_deref().map(vault::stem).unwrap_or_default();
         let name = if name.is_empty() { tr("Diagram", "Schéma").to_string() } else { format!("{name} - {}", tr("diagram", "schéma")) };
-        self.pane_mut().figure = None;
+        self.pane_mut().clear_figure();
         self.add_diagram(&dir, &name, made.diagram, window, cx);
         if made.skipped > 0 {
             let lines = format!("{} {}", made.skipped, if made.skipped == 1 { tr("line was not understood", "ligne n'a pas été comprise") } else { tr("lines were not understood", "lignes n'ont pas été comprises") });
@@ -175,14 +174,10 @@ impl Shell {
             return self.say(Tone::Failed, format!("{} : {}", tr("Diagram not saved", "Schéma non enregistré"), crate::lang::io_reason(&e)), cx);
         }
         self.images.push(path.clone());
-        self.push_names(cx);
-        self.graph_stale = true;
-        self.refresh_graph(cx);
+        self.index_changed(cx);
         self.nav.reveal(&path);
         self.load_note(&path, cx);
-        if self.nav.panel == Panel::Full {
-            self.nav.panel = Panel::Split;
-        }
+        self.nav.give_note_room();
         if let Some(canvas) = self.pane().drawing() {
             window.focus(&canvas.focus_handle(cx));
         } else if let Some(viewer) = self.pane().viewer() {

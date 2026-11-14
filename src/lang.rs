@@ -17,8 +17,16 @@ pub fn tr(en: &'static str, fr: &'static str) -> &'static str {
 
 /// English from now on, whatever the system's language: `bref mcp` talks to a model, and
 /// the library's names and templates it returns are part of what the model reads.
-pub fn speak_english() {
-    let _ = FRENCH.set(false);
+/// Called once, first thing in `main`: if a `tr` already ran the language is fixed, and this
+/// says so (false) instead of silently doing nothing.
+pub fn speak_english() -> bool {
+    choose(&FRENCH, false)
+}
+
+/// Sets the language once; false if it was already fixed to the other one.
+fn choose(cell: &OnceLock<bool>, french: bool) -> bool {
+    let _ = cell.set(french);
+    cell.get() == Some(&french)
 }
 
 #[cfg(test)]
@@ -126,6 +134,12 @@ pub fn number(n: usize) -> String {
     out
 }
 
+/// The noun for a count, as `(English, French)` pairs: 0 and 1 are singular in French
+/// (`0 mot`, `1 mot`, `2 mots`), only 1 is in English (`0 words`, `1 word`).
+pub fn plural(n: usize, one: (&'static str, &'static str), many: (&'static str, &'static str)) -> &'static str {
+    if n < 2 && tr("en", "fr") == "fr" || n == 1 { tr(one.0, one.1) } else { tr(many.0, many.1) }
+}
+
 /// How long ago, in the palette's short form: `today`, `3 d`, `2 wk`, `5 mo`, `1 y` (`aujourd'hui`, `3 j`, `2 sem.`,
 /// `5 mois`, `1 an`). `days` is the age in whole days.
 pub fn age(days: u64) -> String {
@@ -171,7 +185,26 @@ pub fn fold(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_language_is_chosen_once() {
+        let cell = std::sync::OnceLock::new();
+        assert!(super::choose(&cell, false));
+        assert!(super::choose(&cell, false));
+        assert!(!super::choose(&cell, true), "a language fixed earlier is not replaced");
+        // A `tr` that ran first fixes the language: asking for English afterwards says no.
+        let early = std::sync::OnceLock::new();
+        early.get_or_init(|| true);
+        assert!(!super::choose(&early, false));
+    }
+
     use super::*;
+
+    #[test]
+    fn nouns_agree_with_their_count() {
+        let word = |n| plural(n, ("word", "mot"), ("words", "mots"));
+        assert_eq!([0, 1, 2, 1000].map(word), ["mot", "mot", "mots", "mots"]);
+        in_english(|| assert_eq!([0, 1, 2, 1000].map(word), ["words", "word", "words", "words"]));
+    }
 
     #[test]
     fn tells_how_long_ago() {

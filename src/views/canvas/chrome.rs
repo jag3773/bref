@@ -17,7 +17,7 @@ fn row(id: impl Into<gpui::ElementId>, icon: &'static str, label: &'static str, 
         .gap_2()
         .rounded(t.small())
         .cursor_pointer()
-        .text_size(px(12.5))
+        .text_size(t.px(12.5))
         .text_color(t.text)
         .when(lit, |d| d.bg(t.code_bg))
         .when(focus, |d| d.bg(t.selection))
@@ -29,12 +29,12 @@ fn row(id: impl Into<gpui::ElementId>, icon: &'static str, label: &'static str, 
 
 /// The title of a group of rows.
 fn title(text: &'static str, t: Theme) -> Div {
-    div().px_2().pt_2().pb_1().text_size(px(11.)).text_color(t.soft).child(text.to_uppercase())
+    div().px_2().pt_2().pb_1().text_size(t.px(11.)).text_color(t.soft).child(text.to_uppercase())
 }
 
 /// A menu that opens over the canvas.
 fn floating(t: Theme) -> Div {
-    div().p_1().rounded(t.large()).bg(t.panel).border_1().border_color(t.border).shadow(t.floating()).occlude()
+    crate::ui::widgets::popover(t).p_1().occlude()
 }
 
 /// What a row of the menu of a right click does.
@@ -168,7 +168,7 @@ impl Canvas {
     pub(super) fn context_entries(&self) -> Vec<Ctx> {
         let links = self.selected.iter().any(|id| self.diagram.link(*id).is_some());
         let single = self.selected.len() == 1;
-        let alone = matches!(self.selected[..], [id] if self.diagram.shape(id).is_some_and(|s| matches!(s.form, Form::Round | Form::Composite)));
+        let alone = matches!(self.selected[..], [id] if self.diagram.shape(id).is_some_and(|s| s.form.round_outline()));
         let holder = matches!(self.selected[..], [id] if self.diagram.shape(id).is_some_and(|s| s.form.holds()) && !self.diagram.children(id).is_empty());
         if self.selected.is_empty() {
             return vec![Ctx::Text, Ctx::All, Ctx::Fit];
@@ -468,8 +468,8 @@ impl Canvas {
             .border_color(t.border)
             .shadow(t.lifted())
             .occlude()
-            .child(button("d-undo", "c-undo.svg", false, t).when(self.undo.is_empty(), |b| b.opacity(0.4)).tooltip(tip(tr("Undo", "Annuler"), undo, t)).on_click(cx.listener(|this, _, _, cx| this.restore(false, cx))))
-            .child(button("d-redo", "c-redo.svg", false, t).when(self.redo.is_empty(), |b| b.opacity(0.4)).tooltip(tip(tr("Redo", "Rétablir"), redo, t)).on_click(cx.listener(|this, _, _, cx| this.restore(true, cx))))
+            .child(button("d-undo", "c-undo.svg", false, t).when(!self.history.can_undo(), |b| b.opacity(0.4)).tooltip(tip(tr("Undo", "Annuler"), undo, t)).on_click(cx.listener(|this, _, _, cx| this.undo(cx))))
+            .child(button("d-redo", "c-redo.svg", false, t).when(!self.history.can_redo(), |b| b.opacity(0.4)).tooltip(tip(tr("Redo", "Rétablir"), redo, t)).on_click(cx.listener(|this, _, _, cx| this.redo(cx))))
             .when(!self.diagram.messages().is_empty(), |d| {
                 d.child(button("d-numbered", "d-seq-number.svg", self.diagram.numbered, t).tooltip(tip(tr("Number the messages", "Numéroter les messages"), String::new(), t)).on_click(cx.listener(|this, _, _, cx| this.toggle_numbers(cx))))
             })
@@ -507,7 +507,7 @@ impl Canvas {
                     .id("d-zoom-fit")
                     .w(px(52.))
                     .text_center()
-                    .text_size(px(12.))
+                    .text_size(t.font_small())
                     .text_color(t.soft)
                     .cursor_pointer()
                     .tooltip(tip(tr("Fit the diagram", "Ajuster au diagramme"), "0".into(), t))
@@ -574,12 +574,12 @@ impl Canvas {
                     .bg(t.bg)
                     .border_1()
                     .border_color(t.border)
-                    .text_size(px(12.5))
+                    .text_size(t.px(12.5))
                     .child(svg().path("search.svg").size(px(14.)).flex_none().text_color(t.soft))
                     .child(if query.is_empty() { div().text_color(t.soft).child(tr("Search shapes…", "Chercher une forme…")) } else { div().child(format!("{query}▏")) })
                     .into_any_element(),
                 LibChild::Title(name) => title(name, t).into_any_element(),
-                LibChild::Empty => div().px_2().py_1().text_size(px(12.)).text_color(t.soft).child(tr("No shape answers.", "Aucune forme ne répond.")).into_any_element(),
+                LibChild::Empty => div().px_2().py_1().text_size(t.font_small()).text_color(t.soft).child(tr("No shape answers.", "Aucune forme ne répond.")).into_any_element(),
                 LibChild::Row(Lib::Start(i)) => row(("d-start", i), "file-plus.svg", templates[i].name, String::new(), false, focus == Some(Lib::Start(i)), t)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.library = None;
